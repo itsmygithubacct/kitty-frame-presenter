@@ -21,6 +21,7 @@ from kitty_frame_presenter import (  # noqa: E402
     diff_rect,
     diff_rects,
     extract_rect,
+    wrap_tmux_passthrough,
 )
 
 
@@ -125,6 +126,11 @@ class SharedMemoryTests(unittest.TestCase):
 
 
 class BuilderTests(unittest.TestCase):
+    def test_tmux_passthrough_is_public(self):
+        value = wrap_tmux_passthrough("\x1b_Ga=d,d=A\x1b\\")
+        self.assertTrue(value.startswith("\x1bPtmux;"))
+        self.assertIn("\x1b\x1b_G", value)
+
     def test_inline_full_frame_chunks_at_protocol_limit(self):
         rng = random.Random(7)
         data = bytes(rng.randrange(256) for _ in range(100 * 200 * 3))

@@ -251,6 +251,11 @@ def _tmux_wrap(apc: str) -> str:
     return "\x1bPtmux;" + apc.replace("\x1b", "\x1b\x1b") + "\x1b\\"
 
 
+def wrap_tmux_passthrough(apc: str) -> str:
+    """Wrap one control string in tmux's DCS passthrough envelope."""
+    return _tmux_wrap(apc)
+
+
 def _apc(control: str, payload: str = "", in_tmux: bool = False) -> str:
     value = f"\x1b_G{control};{payload}\x1b\\"
     return _tmux_wrap(value) if in_tmux else value

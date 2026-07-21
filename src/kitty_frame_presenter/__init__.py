@@ -26,6 +26,7 @@ from .presenter import (
     diff_rect,
     diff_rects,
     extract_rect,
+    wrap_tmux_passthrough,
 )
 
 __all__ = [
@@ -46,5 +47,5 @@ __all__ = [
     "diff_rect",
     "diff_rects",
     "extract_rect",
+    "wrap_tmux_passthrough",
 ]
-
