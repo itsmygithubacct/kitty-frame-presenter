@@ -17,6 +17,11 @@ The presenter keeps one displayed image stable and updates it in place:
   work, so a slow terminal costs dropped frames instead of growing latency;
 - periodic remote keyframes keep late-attached clients recoverable.
 
+Each `present()` call is synchronous only through creation of the graphics
+escape. The presenter never reads from the terminal, changes descriptor flags,
+or starts a worker thread. Call `flush()` at the next event-loop deadline to
+release the newest frame held by pacing or shared-memory backpressure.
+
 The similarly named
 [`kitty-framebuffer`](https://github.com/itsmygithubacct/kitty-framebuffer)
 has a different contract: it is a C library that owns raw mode, terminal
@@ -40,6 +45,10 @@ presenter.close()
 
 For a remote or tmux-forwarded stream, construct with `stream=True` and, when
 appropriate, `in_tmux=True`.
+
+`invalidate()` discards any queued frame and forgets the displayed base. Call
+it after a resize, screen clear, or other event that invalidates the Kitty
+placement; the next offered frame will be a complete placement.
 
 ## Scroll composition
 
@@ -76,4 +85,3 @@ The API is pre-1.0 and may change between minor releases.
 ## License
 
 MIT. See [LICENSE](LICENSE).
-

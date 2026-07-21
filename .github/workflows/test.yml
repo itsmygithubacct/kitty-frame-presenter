@@ -1,0 +1,23 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Check syntax and tests
+        run: |
+          python3 -m compileall -q src tests
+          python3 -m unittest discover -s tests -v
+          git diff --check "$(git hash-object -t tree /dev/null)" HEAD -- .

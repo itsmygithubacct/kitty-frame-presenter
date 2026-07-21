@@ -425,10 +425,21 @@ class PosixShmRing:
                 data = _as_bytes(payload)
                 if not data:
                     raise ValueError("shared-memory payload cannot be empty")
-                fd = self._open(slot.name, os.O_RDWR | os.O_CREAT | os.O_EXCL)
-                os.ftruncate(fd, len(data))
-                mapping = mmap.mmap(fd, len(data), access=mmap.ACCESS_WRITE)
-                mapping[:] = data
+                fd = -1
+                mapping = None
+                try:
+                    fd = self._open(
+                        slot.name, os.O_RDWR | os.O_CREAT | os.O_EXCL)
+                    os.ftruncate(fd, len(data))
+                    mapping = mmap.mmap(fd, len(data), access=mmap.ACCESS_WRITE)
+                    mapping[:] = data
+                except Exception:
+                    if mapping is not None:
+                        mapping.close()
+                    if fd >= 0:
+                        os.close(fd)
+                    self._unlink(slot.name)
+                    raise
                 slot.fd, slot.mapping, slot.busy = fd, mapping, True
                 made.append(slot)
             return tuple(slot.name for slot in made)
@@ -530,6 +541,12 @@ class FramePresenter:
         return self._last_emit_at + self.frame_interval
 
     def invalidate(self) -> None:
+        # A queued request describes the old placement.  Sending it after a
+        # resize or external clear can briefly restore stale geometry, so make
+        # the caller offer a frame for the new state instead.
+        if self._pending is not None:
+            self.stats.frames_dropped += 1
+            self._pending = None
         self._base_signature = None
         self._previous = None
 
@@ -661,6 +678,14 @@ class FramePresenter:
     def _scroll_candidate(self, request: _Request, normal: Rect):
         shift = request.scroll
         if shift is None:
+            # Cursor/caret-sized damage cannot be a useful screen scroll.  The
+            # guard also avoids hashing every row for the common small-update
+            # path.  Explicit metadata hints are still evaluated regardless
+            # of damage size.
+            normal_area = normal[2] * normal[3]
+            frame_area = request.width * request.height
+            if normal_area < frame_area * 0.20:
+                return None
             shift = detect_vertical_scroll(self._previous, request.rgb,
                                            request.width, request.height)
         if not shift or shift == (0, 0):
@@ -714,4 +739,3 @@ class FramePresenter:
 
     def __exit__(self, *_):
         self.close()
-

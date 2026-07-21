@@ -4,6 +4,7 @@ import random
 import re
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -110,6 +111,18 @@ class SharedMemoryTests(unittest.TestCase):
         finally:
             ring.close()
 
+    def test_partial_allocation_failure_leaves_no_object_or_busy_slot(self):
+        ring = PosixShmRing(1, prefix="kitty-frame-presenter-failure-test")
+        name = ring._slots[0].name
+        try:
+            with mock.patch("mmap.mmap", side_effect=OSError("injected")):
+                with self.assertRaises(OSError):
+                    ring.put_many((b"payload",))
+            self.assertEqual(ring.in_flight, 0)
+            self.assertFalse(os.path.exists("/dev/shm/" + name.lstrip("/")))
+        finally:
+            ring.close()
+
 
 class BuilderTests(unittest.TestCase):
     def test_inline_full_frame_chunks_at_protocol_limit(self):
@@ -205,6 +218,43 @@ class PresenterTests(unittest.TestCase):
             result = presenter.flush()
             self.assertTrue(result.emitted)
             self.assertEqual(term.payloads[-1], frame(width, height, (2, 2, 2)))
+        finally:
+            presenter.close()
+
+    def test_invalidate_discards_stale_pending_geometry(self):
+        now = [10.0]
+        term = ConsumerTerm()
+        presenter = FramePresenter(term, max_fps=10, clock=lambda: now[0])
+        try:
+            width, height = 4, 3
+            presenter.present(frame(width, height), width, height, 2, 2)
+            now[0] += 0.01
+            presenter.present(frame(width, height, (1, 1, 1)),
+                              width, height, 2, 2)
+            presenter.invalidate()
+            now[0] += 1
+            self.assertEqual(presenter.flush().kind, "idle")
+            self.assertEqual(presenter.stats.frames_dropped, 1)
+            result = presenter.present(frame(6, 4), 6, 4, 3, 2)
+            self.assertEqual(result.kind, "full")
+        finally:
+            presenter.close()
+
+    def test_small_damage_skips_automatic_scroll_inference(self):
+        term = ConsumerTerm()
+        presenter = FramePresenter(term, enable_scroll=True)
+        try:
+            width, height = 40, 30
+            before = frame(width, height)
+            presenter.present(before, width, height, 8, 5)
+            after = bytearray(before)
+            after[(12 * width + 17) * 3:(12 * width + 17) * 3 + 3] = b"\xff\0\0"
+            with mock.patch(
+                    "kitty_frame_presenter.presenter.detect_vertical_scroll",
+                    side_effect=AssertionError("small damage was hashed")):
+                result = presenter.present(bytes(after), width, height, 8, 5)
+            self.assertEqual(result.kind, "rect")
+            self.assertEqual(result.rects, ((17, 12, 1, 1),))
         finally:
             presenter.close()
 
