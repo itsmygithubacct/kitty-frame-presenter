@@ -16,8 +16,9 @@ import os
 import secrets
 import time
 import zlib
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Deque, Iterable, Optional, Sequence, Tuple
 
 CHUNK = 4096
 FRAME_BYTES = 3
@@ -454,12 +455,20 @@ class PosixShmRing:
                 self._release(slot)
             raise
 
-    def close(self) -> None:
+    def close(self, *, discard: bool = False) -> None:
+        """Release local handles without invalidating unread payloads.
+
+        Kitty owns the normal unlink acknowledgement.  Keeping an in-flight
+        name present after close lets a terminal that has received, but not yet
+        processed, the command still open the payload.  ``discard=True`` is
+        the explicit abort path for output known never to reach a terminal.
+        """
         if self.closed:
             return
         for slot in self._slots:
             if slot.busy:
-                self._unlink(slot.name)
+                if discard:
+                    self._unlink(slot.name)
                 self._release(slot)
         self.closed = True
 
@@ -481,7 +490,11 @@ class PresenterStats:
     scroll_updates: int = 0
     pixel_bytes: int = 0
     wire_bytes: int = 0
-    latencies_ms: list = field(default_factory=list)
+    latency_samples: int = 0
+    latency_total_ms: float = 0.0
+    latency_max_ms: float = 0.0
+    latencies_ms: Deque[float] = field(
+        default_factory=lambda: deque(maxlen=256))
 
 
 @dataclass(frozen=True)
@@ -637,7 +650,11 @@ class FramePresenter:
         self.stats.scroll_updates += int(scroll)
         self.stats.pixel_bytes += pixel_bytes
         self.stats.wire_bytes += wire_bytes
-        self.stats.latencies_ms.append(max(0.0, (now - request.offered_at) * 1000.0))
+        latency = max(0.0, (now - request.offered_at) * 1000.0)
+        self.stats.latency_samples += 1
+        self.stats.latency_total_ms += latency
+        self.stats.latency_max_ms = max(self.stats.latency_max_ms, latency)
+        self.stats.latencies_ms.append(latency)
         return PresentResult(kind, True, rect_tuple, pixel_bytes, wire_bytes)
 
     def _emit_full(self, request: _Request, now: float) -> PresentResult:
@@ -734,10 +751,10 @@ class FramePresenter:
                                         "scroll", scrolled=True)
         return self._emit_rects(request, now, (normal,))
 
-    def close(self) -> None:
+    def close(self, *, discard: bool = False) -> None:
         self._pending = None
         if self.shm is not None:
-            self.shm.close()
+            self.shm.close(discard=discard)
 
     def __enter__(self):
         return self

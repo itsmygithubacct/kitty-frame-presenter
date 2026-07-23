@@ -43,6 +43,11 @@ presenter.flush()
 presenter.close()
 ```
 
+`close()` releases local mappings and descriptors but deliberately leaves any
+in-flight shared-memory names available until Kitty consumes and unlinks them.
+If buffered output is being abandoned and will never reach a terminal, call
+`close(discard=True)` to unlink those payloads explicitly.
+
 For a remote or tmux-forwarded stream, construct with `stream=True` and, when
 appropriate, `in_tmux=True`.
 

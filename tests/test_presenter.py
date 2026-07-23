@@ -110,7 +110,7 @@ class SharedMemoryTests(unittest.TestCase):
             with open("/dev/shm/" + replacement.lstrip("/"), "rb") as stream:
                 self.assertEqual(stream.read(), b"third")
         finally:
-            ring.close()
+            ring.close(discard=True)
 
     def test_partial_allocation_failure_leaves_no_object_or_busy_slot(self):
         ring = PosixShmRing(1, prefix="kitty-frame-presenter-failure-test")
@@ -123,6 +123,27 @@ class SharedMemoryTests(unittest.TestCase):
             self.assertFalse(os.path.exists("/dev/shm/" + name.lstrip("/")))
         finally:
             ring.close()
+
+    def test_close_keeps_unconsumed_payload_available(self):
+        ring = PosixShmRing(1, prefix="kitty-frame-presenter-close-test")
+        name = ring.put_many((b"deferred",))[0]
+        path = "/dev/shm/" + name.lstrip("/")
+
+        ring.close()
+
+        self.assertTrue(os.path.exists(path))
+        with open(path, "rb") as stream:
+            self.assertEqual(stream.read(), b"deferred")
+        os.unlink(path)
+
+    def test_discard_explicitly_unlinks_unconsumed_payload(self):
+        ring = PosixShmRing(1, prefix="kitty-frame-presenter-discard-test")
+        name = ring.put_many((b"abandoned",))[0]
+        path = "/dev/shm/" + name.lstrip("/")
+
+        ring.close(discard=True)
+
+        self.assertFalse(os.path.exists(path))
 
 
 class BuilderTests(unittest.TestCase):
@@ -275,6 +296,23 @@ class PresenterTests(unittest.TestCase):
                                        width, height, 2, 2)
             self.assertEqual(result.kind, "queued")
             self.assertEqual(len(term.writes), count)
+        finally:
+            presenter.close(discard=True)
+
+    def test_latency_history_is_bounded_but_aggregates_are_complete(self):
+        now = [10.0]
+        term = ConsumerTerm()
+        presenter = FramePresenter(term, stream=True, clock=lambda: now[0])
+        try:
+            for index in range(300):
+                now[0] += 0.001
+                pixel = index % 2
+                presenter.present(bytes((pixel, pixel, pixel)), 1, 1, 1, 1,
+                                  now=now[0])
+            self.assertEqual(presenter.stats.latency_samples, 300)
+            self.assertEqual(len(presenter.stats.latencies_ms), 256)
+            self.assertEqual(presenter.stats.latency_total_ms, 0.0)
+            self.assertEqual(presenter.stats.latency_max_ms, 0.0)
         finally:
             presenter.close()
 
