@@ -18,6 +18,7 @@ from kitty_frame_presenter import (  # noqa: E402
     CHUNK,
     FrameSocketTap,
     FramePresenter,
+    TappedFrame,
     PosixShmRing,
     ShmBusy,
     build_direct,
@@ -444,4 +445,31 @@ class FrameTapTests(unittest.TestCase):
                 self.assertGreaterEqual(tap.frames_dropped, 1)
             finally:
                 presenter.close()
+                tap.close()
+
+    def test_socket_tap_rejects_unencodable_geometry_before_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tap = FrameSocketTap(
+                os.path.join(directory, "absent.tap"), "pane-session",
+                retry_seconds=0.05, send_timeout=0.05)
+            try:
+                invalid = (
+                    {"columns": 1 << 40},
+                    {"width": 1.0},
+                    {"offered_at": float("nan")},
+                    {"scroll": (0, 1 << 40)},
+                    {"scroll": (0.0, 1)},
+                )
+                for changes in invalid:
+                    values = {
+                        "rgb": b"\0\0\0", "width": 1, "height": 1,
+                        "columns": 1, "rows": 1, "scroll": None,
+                        "content_key": None, "offered_at": 1.0,
+                    }
+                    values.update(changes)
+                    with self.subTest(changes=changes), \
+                         self.assertRaises(ValueError):
+                        tap(TappedFrame(**values))
+                self.assertEqual(tap.frames_offered, 0)
+            finally:
                 tap.close()

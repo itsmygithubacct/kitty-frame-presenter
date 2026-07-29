@@ -11,6 +11,7 @@ import base64
 import ctypes
 import ctypes.util
 import errno
+import math
 import mmap
 import os
 import secrets
@@ -586,10 +587,29 @@ class FrameSocketTap:
         return cls(path, session)
 
     def __call__(self, frame: TappedFrame) -> None:
+        geometry = (frame.width, frame.height, frame.columns, frame.rows)
+        if any(type(value) is not int for value in geometry):
+            raise ValueError("frame geometry must contain integers")
         expected = frame.width * frame.height * FRAME_BYTES
         if (frame.width <= 0 or frame.height <= 0 or
+                frame.width > 8192 or frame.height > 8192 or
+                frame.columns <= 0 or frame.rows <= 0 or
+                frame.columns > 10000 or frame.rows > 10000 or
                 len(frame.rgb) != expected or expected > self._FRAME_MAX):
             raise ValueError("invalid RGB frame for socket tap")
+        if (type(frame.offered_at) not in (int, float) or
+                not math.isfinite(frame.offered_at) or
+                frame.offered_at < 0 or
+                frame.offered_at * 1_000_000 >= 1 << 64):
+            raise ValueError("invalid frame time for socket tap")
+        if frame.scroll is not None:
+            if (len(frame.scroll) != 2 or
+                    any(type(value) is not int for value in frame.scroll)):
+                raise ValueError("invalid scroll hint for socket tap")
+            scroll_x, scroll_y = frame.scroll
+            if not (-(1 << 31) <= scroll_x < 1 << 31 and
+                    -(1 << 31) <= scroll_y < 1 << 31):
+                raise ValueError("invalid scroll hint for socket tap")
         with self._condition:
             if self._closed:
                 return
