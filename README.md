@@ -71,6 +71,23 @@ user; `tap_failures` records that it happened.
 
 With no tap, output is byte-identical to before.
 
+`FrameSocketTap` is the ready-made local transport for a multiplexer. It keeps
+one newest-frame slot and performs Unix-socket I/O on a daemon thread, so an
+absent or stalled receiver cannot delay the local terminal:
+
+```python
+from kitty_frame_presenter import FrameSocketTap
+
+tap = FrameSocketTap("/run/user/1000/example.frames", session_id)
+presenter = FramePresenter(term, tap=tap)
+```
+
+The socket stream is framed, carries the originating broker session on every
+frame, and is owner-checked by the receiver. The shared package does not enable
+socket discovery by default; a host can use
+`FrameSocketTap.from_environment()` when it deliberately provides
+`KILIX_FRAME_TAP_SOCKET` or `KILIX_FRAME_TAP_DIRECTORY`.
+
 `invalidate()` discards any queued frame and forgets the displayed base. Call
 it after a resize, screen clear, or other event that invalidates the Kitty
 placement; the next offered frame will be a complete placement.

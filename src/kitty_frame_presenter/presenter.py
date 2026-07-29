@@ -14,6 +14,9 @@ import errno
 import mmap
 import os
 import secrets
+import socket
+import struct
+import threading
 import time
 import zlib
 from collections import deque
@@ -523,6 +526,161 @@ class TappedFrame:
     scroll: Optional[Tuple[int, int]]
     content_key: object
     offered_at: float
+
+
+class FrameSocketTap:
+    """Non-blocking handoff from a presenter to a local Unix socket.
+
+    The presenter thread only replaces one newest-frame slot.  Connecting and
+    writing happen on a daemon thread, so an absent or stalled consumer cannot
+    delay local presentation.  The socket is local and expected to be private;
+    the receiver additionally checks the broker session carried in every
+    header.
+    """
+
+    _HEADER = struct.Struct("!4sHH64sIIIIiiQQ")
+    _VERSION = 1
+    _FRAME_MAX = 64 * 1024 * 1024
+
+    def __init__(self, path: str, session: str, *,
+                 retry_seconds: float = 1.0,
+                 send_timeout: float = 0.5):
+        encoded_session = session.encode("ascii")
+        if not os.path.isabs(path):
+            raise ValueError("frame tap socket path must be absolute")
+        if not encoded_session or len(encoded_session) > 64 or b"\0" in encoded_session:
+            raise ValueError("frame tap session must be 1 to 64 ASCII bytes")
+        self.path = path
+        self.session = encoded_session
+        self.retry_seconds = max(0.05, float(retry_seconds))
+        self.send_timeout = max(0.05, float(send_timeout))
+        self.frames_offered = 0
+        self.frames_sent = 0
+        self.frames_dropped = 0
+        self.failures = 0
+        self._condition = threading.Condition()
+        self._pending: Optional[TappedFrame] = None
+        self._closed = False
+        self._socket: Optional[socket.socket] = None
+        self._retry_at = float("-inf")
+        self._thread = threading.Thread(
+            target=self._run, name="kitty-frame-tap", daemon=True)
+        self._thread.start()
+
+    @classmethod
+    def from_environment(cls) -> Optional["FrameSocketTap"]:
+        """Create the explicitly configured tap, or return ``None``.
+
+        The shared package never enables discovery by itself.  A host such as
+        Kilix can set ``KILIX_FRAME_TAP_SOCKET`` (or a private directory from
+        which the session-specific name is derived) without changing callers.
+        """
+
+        session = os.environ.get("KITTY_PTY_BROKER_SESSION", "")
+        path = os.environ.get("KILIX_FRAME_TAP_SOCKET", "")
+        directory = os.environ.get("KILIX_FRAME_TAP_DIRECTORY", "")
+        if not path and directory and session:
+            path = os.path.join(directory, f"{session}.tap")
+        if not path or not session:
+            return None
+        return cls(path, session)
+
+    def __call__(self, frame: TappedFrame) -> None:
+        expected = frame.width * frame.height * FRAME_BYTES
+        if (frame.width <= 0 or frame.height <= 0 or
+                len(frame.rgb) != expected or expected > self._FRAME_MAX):
+            raise ValueError("invalid RGB frame for socket tap")
+        with self._condition:
+            if self._closed:
+                return
+            self.frames_offered += 1
+            if self._pending is not None:
+                self.frames_dropped += 1
+            self._pending = frame
+            self._condition.notify()
+
+    @staticmethod
+    def _scroll(frame: TappedFrame) -> Tuple[int, int]:
+        if frame.scroll is None:
+            # INT32_MIN means that no producer hint was supplied.
+            return -(1 << 31), -(1 << 31)
+        return int(frame.scroll[0]), int(frame.scroll[1])
+
+    def _encode_header(self, frame: TappedFrame) -> bytes:
+        scroll_x, scroll_y = self._scroll(frame)
+        return self._HEADER.pack(
+            b"KFT1", self._VERSION, 0,
+            self.session.ljust(64, b"\0"),
+            frame.width, frame.height, frame.columns, frame.rows,
+            scroll_x, scroll_y,
+            max(0, int(frame.offered_at * 1_000_000)),
+            len(frame.rgb),
+        )
+
+    def _disconnect(self) -> None:
+        sock, self._socket = self._socket, None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _connect(self) -> bool:
+        now = time.monotonic()
+        if now < self._retry_at:
+            return False
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.send_timeout)
+        try:
+            sock.connect(self.path)
+        except OSError:
+            sock.close()
+            self.failures += 1
+            self._retry_at = now + self.retry_seconds
+            return False
+        self._socket = sock
+        self._retry_at = float("-inf")
+        return True
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None and not self._closed:
+                    self._condition.wait()
+                if self._closed:
+                    break
+                frame, self._pending = self._pending, None
+            if frame is None:
+                continue
+            if self._socket is None and not self._connect():
+                self.frames_dropped += 1
+                continue
+            sock = self._socket
+            if sock is None:
+                self.frames_dropped += 1
+                continue
+            try:
+                sock.sendall(self._encode_header(frame))
+                sock.sendall(frame.rgb)
+                self.frames_sent += 1
+            except OSError:
+                self.failures += 1
+                self.frames_dropped += 1
+                self._disconnect()
+                self._retry_at = time.monotonic() + self.retry_seconds
+        self._disconnect()
+
+    def close(self) -> None:
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            if self._pending is not None:
+                self.frames_dropped += 1
+                self._pending = None
+            self._condition.notify()
+        self._disconnect()
+        self._thread.join(timeout=self.send_timeout + 0.25)
 
 
 @dataclass

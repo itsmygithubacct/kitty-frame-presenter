@@ -2,7 +2,11 @@ import base64
 import os
 import random
 import re
+import socket
+import struct
 import sys
+import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -12,6 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from kitty_frame_presenter import (  # noqa: E402
     CHUNK,
+    FrameSocketTap,
     FramePresenter,
     PosixShmRing,
     ShmBusy,
@@ -388,3 +393,55 @@ class FrameTapTests(unittest.TestCase):
         # And it is not called again.
         presenter.present(rgb, 4, 3, 2, 1)
         self.assertEqual(len(calls), 1)
+
+    def test_socket_tap_carries_session_geometry_and_pixels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "frame.tap")
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(path)
+            listener.listen(1)
+            listener.settimeout(2)
+            tap = FrameSocketTap(path, "pane-session", retry_seconds=0.05)
+            presenter = self._presenter(ConsumerTerm(), tap=tap)
+            rgb = bytes(range(36))
+            try:
+                presenter.present(
+                    rgb, 4, 3, 2, 1, scroll=(0, -8), now=1.25)
+                source, _ = listener.accept()
+                with source:
+                    source.settimeout(2)
+                    received = bytearray()
+                    while len(received) < 112 + len(rgb):
+                        block = source.recv(112 + len(rgb) - len(received))
+                        self.assertTrue(block)
+                        received.extend(block)
+                fields = struct.unpack("!4sHH64sIIIIiiQQ", received[:112])
+                self.assertEqual(fields[0:3], (b"KFT1", 1, 0))
+                self.assertEqual(fields[3].rstrip(b"\0"), b"pane-session")
+                self.assertEqual(fields[4:8], (4, 3, 2, 1))
+                self.assertEqual(fields[8:10], (0, -8))
+                self.assertEqual(fields[10], 1_250_000)
+                self.assertEqual(fields[11], len(rgb))
+                self.assertEqual(bytes(received[112:]), rgb)
+            finally:
+                presenter.close()
+                tap.close()
+                listener.close()
+
+    def test_absent_socket_never_breaks_local_presentation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tap = FrameSocketTap(
+                os.path.join(directory, "absent.tap"), "pane-session",
+                retry_seconds=0.05, send_timeout=0.05)
+            terminal = ConsumerTerm()
+            presenter = self._presenter(terminal, tap=tap)
+            try:
+                presenter.present(bytes(36), 4, 3, 2, 1)
+                deadline = time.monotonic() + 1
+                while not tap.frames_dropped and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(terminal.output())
+                self.assertGreaterEqual(tap.frames_dropped, 1)
+            finally:
+                presenter.close()
+                tap.close()
