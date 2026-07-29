@@ -506,6 +506,25 @@ class PresentResult:
     wire_bytes: int = 0
 
 
+@dataclass(frozen=True)
+class TappedFrame:
+    """One frame as it was offered, for a consumer other than this terminal.
+
+    Deliberately a copy of what the caller supplied rather than anything this
+    presenter has computed: a remote consumer paces itself, so it must not
+    inherit this terminal's drop decisions or its damage arithmetic.
+    """
+
+    rgb: bytes
+    width: int
+    height: int
+    columns: int
+    rows: int
+    scroll: Optional[Tuple[int, int]]
+    content_key: object
+    offered_at: float
+
+
 @dataclass
 class _Request:
     rgb: bytes
@@ -529,6 +548,7 @@ class FramePresenter:
                  shm_slots: int = 3, enable_scroll: Optional[bool] = None,
                  stream_keyframe_seconds: float = 5.0,
                  stream_warmup_seconds: float = 4.0,
+                 tap=None,
                  clock=time.monotonic):
         if image_id <= 0:
             raise ValueError("image_id must be positive")
@@ -549,6 +569,8 @@ class FramePresenter:
         self._base_signature = None
         self._previous = None
         self._pending: Optional[_Request] = None
+        self.tap = tap
+        self.tap_failures = 0
         self.stats = PresenterStats()
         self.shm = None if stream else PosixShmRing(shm_slots)
 
@@ -590,6 +612,7 @@ class FramePresenter:
         request = self._request(rgb, width, height, columns, rows, origin_row,
                                 origin_column, content_key, force_full, scroll, now)
         self.stats.frames_offered += 1
+        self._offer_to_tap(request)
         if self._pending is not None:
             self.stats.frames_dropped += 1
             self._pending = None
@@ -601,6 +624,33 @@ class FramePresenter:
             self._pending = request
             return PresentResult("queued")
         return result
+
+    def _offer_to_tap(self, request: _Request) -> None:
+        """Hand the frame to a second consumer, if one is attached.
+
+        Every offered frame is seen, including ones this terminal is about to
+        drop, because a remote consumer has its own pacing.
+
+        A tap that raises is disconnected rather than propagated: a second
+        consumer must never be able to break the terminal that is actually in
+        front of the user.
+        """
+        if self.tap is None:
+            return
+        try:
+            self.tap(TappedFrame(
+                rgb=request.rgb,
+                width=request.width,
+                height=request.height,
+                columns=request.columns,
+                rows=request.rows,
+                scroll=request.scroll,
+                content_key=request.content_key,
+                offered_at=request.offered_at,
+            ))
+        except Exception:
+            self.tap_failures += 1
+            self.tap = None
 
     def flush(self, now: Optional[float] = None) -> PresentResult:
         if self._pending is None:

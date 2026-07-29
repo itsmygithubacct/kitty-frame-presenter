@@ -319,3 +319,72 @@ class PresenterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FrameTapTests(unittest.TestCase):
+    """A second consumer of the frames, for a remote encoder.
+
+    The tap exists so a multiplexer can encode for the network without
+    re-deriving what the presenter already has, and without the terminal in
+    front of the user paying for it.
+    """
+
+    def _presenter(self, terminal, **kwargs):
+        return FramePresenter(terminal, image_id=9, clock=lambda: 0.0, **kwargs)
+
+    @staticmethod
+    def _without_shm_names(text):
+        """Blank the shared-memory object names, which are unique per
+        presenter by design and so always differ between two instances."""
+        return re.sub(r"(t=s[^;]*;)[A-Za-z0-9+/=]+", r"\1<name>", text)
+
+    def test_absent_tap_changes_nothing(self):
+        plain, tapped = ConsumerTerm(), ConsumerTerm()
+        rgb = bytes(3 * 4 * 3)
+        self._presenter(plain).present(rgb, 4, 3, 2, 1)
+        self._presenter(tapped, tap=None).present(rgb, 4, 3, 2, 1)
+        self.assertEqual(
+            self._without_shm_names(plain.output()),
+            self._without_shm_names(tapped.output()))
+
+    def test_tap_sees_every_offered_frame(self):
+        seen = []
+        terminal = ConsumerTerm()
+        presenter = self._presenter(terminal, max_fps=1, tap=seen.append)
+        first = bytes(3 * 4 * 3)
+        second = bytes([1]) * (3 * 4 * 3)
+        presenter.present(first, 4, 3, 2, 1, now=0.0)
+        # Offered inside the frame interval, so the terminal never sees it -
+        # but a remote consumer paces itself and must still be told.
+        presenter.present(second, 4, 3, 2, 1, now=0.01)
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[0].rgb, first)
+        self.assertEqual(seen[1].rgb, second)
+        self.assertEqual(seen[1].width, 4)
+        self.assertEqual(seen[1].height, 3)
+
+    def test_tap_receives_the_scroll_hint(self):
+        seen = []
+        terminal = ConsumerTerm()
+        presenter = self._presenter(terminal, tap=seen.append)
+        presenter.present(bytes(3 * 4 * 3), 4, 3, 2, 1, scroll=(0, -8))
+        self.assertEqual(seen[0].scroll, (0, -8))
+
+    def test_a_failing_tap_is_disconnected_not_propagated(self):
+        calls = []
+
+        def broken(frame):
+            calls.append(frame)
+            raise RuntimeError("the remote encoder fell over")
+
+        terminal = ConsumerTerm()
+        presenter = self._presenter(terminal, tap=broken)
+        rgb = bytes(3 * 4 * 3)
+        # The local terminal must be unharmed by a second consumer failing.
+        presenter.present(rgb, 4, 3, 2, 1)
+        self.assertTrue(terminal.output())
+        self.assertIsNone(presenter.tap)
+        self.assertEqual(presenter.tap_failures, 1)
+        # And it is not called again.
+        presenter.present(rgb, 4, 3, 2, 1)
+        self.assertEqual(len(calls), 1)

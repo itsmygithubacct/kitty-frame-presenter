@@ -51,6 +51,26 @@ If buffered output is being abandoned and will never reach a terminal, call
 For a remote or tmux-forwarded stream, construct with `stream=True` and, when
 appropriate, `in_tmux=True`.
 
+## Frame tap
+
+A second consumer can receive the frames without affecting the first:
+
+```python
+presenter = FramePresenter(term, tap=encoder.offer)
+```
+
+The tap sees **every offered frame**, including ones the presenter is about to
+drop for pacing, because a remote consumer paces itself and must not inherit
+this terminal's drop decisions. It receives a `TappedFrame`: the pixels, the
+geometry, and the scroll hint as the caller supplied them — not this
+presenter's damage arithmetic, which belongs to this terminal's own state.
+
+A tap that raises is disconnected rather than propagated. A second consumer
+must never be able to break the terminal that is actually in front of the
+user; `tap_failures` records that it happened.
+
+With no tap, output is byte-identical to before.
+
 `invalidate()` discards any queued frame and forgets the displayed base. Call
 it after a resize, screen clear, or other event that invalidates the Kitty
 placement; the next offered frame will be a complete placement.
