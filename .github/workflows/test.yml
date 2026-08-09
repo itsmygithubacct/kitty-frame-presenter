@@ -18,6 +18,5 @@ jobs:
 
       - name: Check syntax and tests
         run: |
-          python3 -m compileall -q src tests
-          python3 -m unittest discover -s tests -v
+          make test
           git diff --check "$(git hash-object -t tree /dev/null)" HEAD -- .

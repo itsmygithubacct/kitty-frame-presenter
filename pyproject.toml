@@ -1,21 +1,52 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "kitty-frame-presenter"
-version = "0.1.0"
+version = "0.2.0"
 description = "Damage-aware RGB frame presentation through the Kitty graphics protocol"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
-authors = [{name = "itsmygithubacct"}]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "itsmygithubacct", email = "itsmygithubacct@users.noreply.github.com"}]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: POSIX :: Linux",
+  "Typing :: Typed",
 ]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+kitty_frame_presenter = ["py.typed"]
+
+[tool.coverage.run]
+branch = true
+source = ["kitty_frame_presenter"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 90
+
+[tool.mypy]
+strict = true
+files = ["src"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
+ignore = ["RUF022", "SIM105"]
+
+[tool.ruff.lint.per-file-ignores]
+"benchmarks/*.py" = ["E402"]
+"tests/*.py" = ["E402"]

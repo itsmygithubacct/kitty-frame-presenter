@@ -1,7 +1,8 @@
 # kitty-frame-presenter
 
 `kitty-frame-presenter` is a small, dependency-free Python library for
-presenting changing RGB framebuffers through the Kitty graphics protocol. It
+presenting changing RGB framebuffers through the
+[Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/). It
 does not take over the terminal or parse input. It composes with an existing
 TTY/event loop by accepting any object with a `write(str)` method.
 
@@ -51,6 +52,19 @@ If buffered output is being abandoned and will never reach a terminal, call
 For a remote or tmux-forwarded stream, construct with `stream=True` and, when
 appropriate, `in_tmux=True`.
 
+`present()` accepts bytes or another buffer-protocol object and snapshots it
+before retaining or tapping the frame. Widths, heights, placement fields, image
+IDs, and scroll offsets must be exact integers in their protocol ranges; frame
+times must be finite, non-negative values. Malformed input fails before state or
+statistics advance. Calling `present()` after `close()` raises `RuntimeError`.
+Both `FramePresenter` and `PosixShmRing` can be used as context managers.
+
+When work is queued, `next_deadline` is the earliest useful monotonic time for
+`flush()`. It accounts for both frame pacing and a short future retry after
+shared-memory saturation, so an event loop does not need to poll continuously.
+`PresentResult` and `PresenterStats` report the chosen path, exact rectangles,
+pixel and wire bytes, drops, keyframes, scrolls, and bounded latency history.
+
 ## Frame tap
 
 A second consumer can receive the frames without affecting the first:
@@ -83,8 +97,12 @@ presenter = FramePresenter(term, tap=tap)
 ```
 
 The socket stream is framed, carries the originating broker session on every
-frame, and is owner-checked by the receiver. The shared package does not enable
-socket discovery by default; a host can use
+frame, and checks the connected peer's effective user ID on Linux. A receiver
+should still create the socket in an owner-private directory and validate the
+session in every header. Paths must be absolute and fit Linux's Unix-socket
+limit; sessions use 1–64 safe ASCII characters. Frames are bounded to 64 MiB,
+send timeouts to 60 seconds, and retry intervals to one hour. The shared package
+does not enable socket discovery by default; a host can use
 `FrameSocketTap.from_environment()` when it deliberately provides
 `KILIX_FRAME_TAP_SOCKET` or `KILIX_FRAME_TAP_DIRECTORY`.
 
@@ -108,12 +126,24 @@ unchanged.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests -v
+make test
 ```
 
 The tests consume shared-memory escapes like a terminal, exercise saturation
-and safe slot reuse, verify exact damage/scroll results, and pin newest-frame
-pacing behavior.
+and safe slot reuse, verify exact damage/scroll results, reconstruct randomized
+inline presentation sequences, exercise socket and cleanup failure paths, and
+pin newest-frame pacing behavior.
+
+Run the deterministic performance workload with:
+
+```sh
+make benchmark
+```
+
+It reports JSON nanosecond medians for unchanged, small, full, split, and highly
+fragmented damage; vertical prediction; full and rectangular inline encoding;
+wire accounting; and a shared-memory round trip. Timings are comparative and
+depend on the host, while the emitted checksum makes workload drift visible.
 
 ## Scope
 

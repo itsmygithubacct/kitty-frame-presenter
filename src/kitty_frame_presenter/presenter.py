@@ -21,78 +21,182 @@ import threading
 import time
 import zlib
 from collections import deque
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Deque, Iterable, Optional, Sequence, Tuple
+from typing import Any, Protocol, cast
 
 CHUNK = 4096
 FRAME_BYTES = 3
 _SCAN_PIXELS = 32
 _SYNC_BEGIN = "\x1b[?2026h"
 _SYNC_END = "\x1b[?2026l"
+_UINT32_MAX = (1 << 32) - 1
+_INT32_MIN = -(1 << 31)
+_INT32_MAX = (1 << 31) - 1
+_MAX_SHM_SLOTS = 64
+_SHM_RETRY_SECONDS = 0.005
+_UNIX_SOCKET_PATH_BYTES = 107
+_MAX_TAP_RETRY_SECONDS = 3600.0
+_MAX_TAP_SEND_TIMEOUT = 60.0
+_SESSION_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
 
-Rect = Tuple[int, int, int, int]
+Rect = tuple[int, int, int, int]
 
 
-def _as_bytes(value) -> bytes:
-    return value if isinstance(value, bytes) else bytes(value)
+class TerminalWriter(Protocol):
+    def write(self, value: str) -> object: ...
 
 
-def _valid_frames(prev, cur, width: int, height: int) -> Tuple[bytes, bytes]:
-    if width <= 0 or height <= 0:
-        raise ValueError("frame dimensions must be positive")
+def _integer(
+    value: object,
+    label: str,
+    *,
+    minimum: int = 0,
+    maximum: int = _UINT32_MAX,
+) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(f"{label} must be an integer from {minimum} to {maximum}")
+    return value
+
+
+def _number(
+    value: object,
+    label: str,
+    *,
+    minimum: float = 0.0,
+    maximum: float | None = None,
+) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a finite number")
+    try:
+        result = float(cast(Any, value))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} must be a finite number") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{label} must be a finite number")
+    if maximum is not None and result > maximum:
+        raise ValueError(f"{label} must not exceed {maximum:g}")
+    return max(minimum, result)
+
+
+def _time_value(value: object, label: str = "frame time") -> float:
+    result = _number(value, label, minimum=float("-inf"))
+    if result < 0:
+        raise ValueError(f"{label} must not be negative")
+    if result * 1_000_000 >= 1 << 64:
+        raise ValueError(f"{label} is outside the supported range")
+    return result
+
+
+def _rectangle(value: object, label: str = "damage rectangle") -> Rect:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes, bytearray))
+        or len(value) != 4
+    ):
+        raise ValueError(f"{label} must contain x, y, width, and height")
+    x = _integer(value[0], f"{label} x")
+    y = _integer(value[1], f"{label} y")
+    width = _integer(value[2], f"{label} width", minimum=1)
+    height = _integer(value[3], f"{label} height", minimum=1)
+    if x + width > _UINT32_MAX or y + height > _UINT32_MAX:
+        raise ValueError(f"{label} exceeds the protocol coordinate range")
+    return x, y, width, height
+
+
+def _scroll_hint(value: object, label: str = "scroll hint") -> tuple[int, int]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes, bytearray))
+        or len(value) != 2
+    ):
+        raise ValueError(f"{label} must contain integer x and y offsets")
+    return (
+        _integer(value[0], f"{label} x", minimum=_INT32_MIN, maximum=_INT32_MAX),
+        _integer(value[1], f"{label} y", minimum=_INT32_MIN, maximum=_INT32_MAX),
+    )
+
+
+def _as_bytes(value: object) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    try:
+        return memoryview(cast(Any, value)).tobytes()
+    except (TypeError, ValueError, OverflowError, BufferError) as exc:
+        raise ValueError("RGB frame must be bytes-like") from exc
+
+
+def _valid_frames(
+    prev: object, cur: object, width: int, height: int
+) -> tuple[bytes, bytes]:
+    width = _integer(width, "frame width", minimum=1)
+    height = _integer(height, "frame height", minimum=1)
     expected = width * height * FRAME_BYTES
     p, c = _as_bytes(prev), _as_bytes(cur)
     if len(p) != expected or len(c) != expected:
         raise ValueError(
-            f"RGB frame length must be {expected} bytes for {width}x{height}")
+            f"RGB frame length must be {expected} bytes for {width}x{height}"
+        )
     return p, c
 
 
-def _row_bounds(p: bytes, c: bytes, offset: int, width: int) -> Optional[Tuple[int, int]]:
+def _row_bounds(p: bytes, c: bytes, offset: int, width: int) -> tuple[int, int] | None:
     """Return the first/last changed pixel columns for one RGB row."""
     stride = width * FRAME_BYTES
-    if p[offset:offset + stride] == c[offset:offset + stride]:
+    if p[offset : offset + stride] == c[offset : offset + stride]:
         return None
     step = _SCAN_PIXELS * FRAME_BYTES
     left_block = 0
     while left_block < stride:
         end = min(stride, left_block + step)
-        if p[offset + left_block:offset + end] != c[offset + left_block:offset + end]:
+        if (
+            p[offset + left_block : offset + end]
+            != c[offset + left_block : offset + end]
+        ):
             break
         left_block = end
     left = left_block // FRAME_BYTES
     for x in range(left, min(width, left + _SCAN_PIXELS)):
         at = offset + x * FRAME_BYTES
-        if p[at:at + FRAME_BYTES] != c[at:at + FRAME_BYTES]:
+        if p[at : at + FRAME_BYTES] != c[at : at + FRAME_BYTES]:
             left = x
             break
 
     right_block = stride
     while right_block > 0:
         start = max(0, right_block - step)
-        if p[offset + start:offset + right_block] != c[offset + start:offset + right_block]:
+        if (
+            p[offset + start : offset + right_block]
+            != c[offset + start : offset + right_block]
+        ):
             break
         right_block = start
     right = min(width, (right_block + FRAME_BYTES - 1) // FRAME_BYTES)
     for x in range(right - 1, max(left - 1, right - _SCAN_PIXELS - 1), -1):
         at = offset + x * FRAME_BYTES
-        if p[at:at + FRAME_BYTES] != c[at:at + FRAME_BYTES]:
+        if p[at : at + FRAME_BYTES] != c[at : at + FRAME_BYTES]:
             right = x + 1
             break
     return left, right
 
 
-def diff_rect(prev, cur, width: int, height: int) -> Optional[Rect]:
+def diff_rect(prev: object, cur: object, width: int, height: int) -> Rect | None:
     """Return the exact bounding rectangle changed between two RGB frames."""
     p, c = _valid_frames(prev, cur, width, height)
     if prev is cur or p == c:
         return None
     stride = width * FRAME_BYTES
     top = 0
-    while p[top * stride:(top + 1) * stride] == c[top * stride:(top + 1) * stride]:
+    while p[top * stride : (top + 1) * stride] == c[top * stride : (top + 1) * stride]:
         top += 1
     bottom = height
-    while bottom > top + 1 and p[(bottom - 1) * stride:bottom * stride] == c[(bottom - 1) * stride:bottom * stride]:
+    while (
+        bottom > top + 1
+        and p[(bottom - 1) * stride : bottom * stride]
+        == c[(bottom - 1) * stride : bottom * stride]
+    ):
         bottom -= 1
     left, right = width, 0
     for y in range(top, bottom):
@@ -106,7 +210,9 @@ def diff_rect(prev, cur, width: int, height: int) -> Optional[Rect]:
     return left, top, right - left, bottom - top
 
 
-def diff_band(prev, cur, width: int, height: int):
+def diff_band(
+    prev: object, cur: object, width: int, height: int
+) -> tuple[int, int] | None:
     """Compatibility helper returning only the changed row band."""
     try:
         rect = diff_rect(prev, cur, width, height)
@@ -115,23 +221,28 @@ def diff_band(prev, cur, width: int, height: int):
     return None if rect is None else (rect[1], rect[3])
 
 
-def diff_rects(prev, cur, width: int, height: int, max_rects: int = 2) -> Tuple[Rect, ...]:
+def diff_rects(
+    prev: object,
+    cur: object,
+    width: int,
+    height: int,
+    max_rects: int = 2,
+) -> tuple[Rect, ...]:
     """Return up to ``max_rects`` exact rectangles split at clean row gaps.
 
     Scroll composition commonly leaves two disjoint regions: fixed chrome at
     one edge and a newly exposed strip at the other.  Keeping those separate
     avoids turning their bounding box back into an almost-full frame.
     """
-    if max_rects < 1:
-        raise ValueError("max_rects must be positive")
+    max_rects = _integer(max_rects, "max_rects", minimum=1)
     p, c = _valid_frames(prev, cur, width, height)
     if prev is cur or p == c:
         return ()
     stride = width * FRAME_BYTES
-    bands = []
-    start = None
+    bands: list[tuple[int, int]] = []
+    start: int | None = None
     for y in range(height):
-        changed = p[y * stride:(y + 1) * stride] != c[y * stride:(y + 1) * stride]
+        changed = p[y * stride : (y + 1) * stride] != c[y * stride : (y + 1) * stride]
         if changed and start is None:
             start = y
         elif not changed and start is not None:
@@ -140,13 +251,27 @@ def diff_rects(prev, cur, width: int, height: int, max_rects: int = 2) -> Tuple[
     if start is not None:
         bands.append((start, height))
 
-    while len(bands) > max_rects:
-        # Merge the pair separated by the smallest clean gap.  This minimizes
-        # overdraw while retaining the bounded-command/backpressure contract.
-        at = min(range(len(bands) - 1), key=lambda i: bands[i + 1][0] - bands[i][1])
-        bands[at:at + 2] = [(bands[at][0], bands[at + 1][1])]
+    if len(bands) > max_rects:
+        # Repeatedly splicing the smallest gap is quadratic for alternating
+        # rows.  The gaps never change as their neighbors merge, so the same
+        # result is obtained by retaining the largest max_rects - 1 gaps once.
+        gaps = (
+            (bands[index + 1][0] - bands[index][1], index)
+            for index in range(len(bands) - 1)
+        )
+        split_after = {
+            index for _gap, index in sorted(gaps, reverse=True)[: max_rects - 1]
+        }
+        merged: list[tuple[int, int]] = []
+        top = bands[0][0]
+        for index, (_start, bottom) in enumerate(bands):
+            if index in split_after:
+                merged.append((top, bottom))
+                top = bands[index + 1][0]
+        merged.append((top, bands[-1][1]))
+        bands = merged
 
-    out = []
+    out: list[Rect] = []
     for top, bottom in bands:
         left, right = width, 0
         for y in range(top, bottom):
@@ -157,30 +282,37 @@ def diff_rects(prev, cur, width: int, height: int, max_rects: int = 2) -> Tuple[
     return tuple(out)
 
 
-def extract_rect(rgb, width: int, height: int, rect: Rect) -> bytes:
+def extract_rect(rgb: object, width: int, height: int, rect: Rect) -> bytes:
     """Copy one rectangular region from a tightly packed RGB frame."""
     frame = _as_bytes(rgb)
+    width = _integer(width, "frame width", minimum=1)
+    height = _integer(height, "frame height", minimum=1)
     expected = width * height * FRAME_BYTES
     if len(frame) != expected:
         raise ValueError(f"RGB frame length must be {expected}")
-    x, y, rw, rh = rect
-    if rw <= 0 or rh <= 0 or x < 0 or y < 0 or x + rw > width or y + rh > height:
+    x, y, rw, rh = _rectangle(rect)
+    if x + rw > width or y + rh > height:
         raise ValueError("damage rectangle is outside the frame")
     if x == 0 and rw == width:
         stride = width * FRAME_BYTES
-        return frame[y * stride:(y + rh) * stride]
+        return frame[y * stride : (y + rh) * stride]
     stride = width * FRAME_BYTES
     row_bytes = rw * FRAME_BYTES
     out = bytearray(row_bytes * rh)
     for row in range(rh):
         source = (y + row) * stride + x * FRAME_BYTES
         target = row * row_bytes
-        out[target:target + row_bytes] = frame[source:source + row_bytes]
+        out[target : target + row_bytes] = frame[source : source + row_bytes]
     return bytes(out)
 
 
-def detect_vertical_scroll(prev, cur, width: int, height: int,
-                           max_shift: Optional[int] = None) -> Optional[Tuple[int, int]]:
+def detect_vertical_scroll(
+    prev: object,
+    cur: object,
+    width: int,
+    height: int,
+    max_shift: int | None = None,
+) -> tuple[int, int] | None:
     """Infer vertical screen motion as ``(0, dy)`` from matching RGB rows.
 
     ``dy < 0`` means old pixels moved upward.  Candidates are obtained from a
@@ -193,16 +325,22 @@ def detect_vertical_scroll(prev, cur, width: int, height: int,
     if p == c or height < 8:
         return None
     stride = width * FRAME_BYTES
-    limit = min(max_shift or max(1, height // 3), height - 2)
-    old_rows = {}
+    if max_shift is None:
+        limit = max(1, height // 3)
+    else:
+        limit = _integer(max_shift, "max_shift")
+        if limit == 0:
+            return None
+    limit = min(limit, height - 2)
+    old_rows: dict[int, list[int]] = {}
     for y in range(height):
-        checksum = zlib.crc32(memoryview(p)[y * stride:(y + 1) * stride])
+        checksum = zlib.crc32(memoryview(p)[y * stride : (y + 1) * stride])
         old_rows.setdefault(checksum, []).append(y)
-    votes = {}
+    votes: dict[int, int] = {}
     sample_count = min(17, height)
     for index in range(sample_count):
         y = index * (height - 1) // max(1, sample_count - 1)
-        checksum = zlib.crc32(memoryview(c)[y * stride:(y + 1) * stride])
+        checksum = zlib.crc32(memoryview(c)[y * stride : (y + 1) * stride])
         for old_y in old_rows.get(checksum, ()):
             dy = y - old_y
             if dy and abs(dy) <= limit:
@@ -217,14 +355,15 @@ def detect_vertical_scroll(prev, cur, width: int, height: int,
             row = index * (overlap - 1) // max(1, checks - 1)
             po = (src_y + row) * stride
             co = (dst_y + row) * stride
-            matches += p[po:po + stride] == c[co:co + stride]
+            matches += p[po : po + stride] == c[co : co + stride]
         if checks and matches / checks >= 0.60:
             return 0, dy
     return None
 
 
-def _shift_prediction(prev: bytes, width: int, height: int,
-                      dx: int, dy: int) -> Tuple[bytes, Rect, Rect]:
+def _shift_prediction(
+    prev: bytes, width: int, height: int, dx: int, dy: int
+) -> tuple[bytes, Rect, Rect]:
     """Simulate an overlapping replacement compose on a root frame.
 
     Returns predicted pixels, source rectangle and destination rectangle.
@@ -241,14 +380,22 @@ def _shift_prediction(prev: bytes, width: int, height: int,
     result = bytearray(prev)
     stride = width * FRAME_BYTES
     row_bytes = copy_w * FRAME_BYTES
-    # Snapshot the overlap before assigning because source/destination overlap.
-    moved = bytearray(row_bytes * copy_h)
-    for row in range(copy_h):
-        at = (src_y + row) * stride + src_x * FRAME_BYTES
-        moved[row * row_bytes:(row + 1) * row_bytes] = prev[at:at + row_bytes]
-    for row in range(copy_h):
-        at = (dst_y + row) * stride + dst_x * FRAME_BYTES
-        result[at:at + row_bytes] = moved[row * row_bytes:(row + 1) * row_bytes]
+    # ``prev`` is immutable and separate from ``result``, so reading directly
+    # from it is overlap-safe and avoids a second near-frame-sized snapshot.
+    if src_x == 0 and copy_w == width:
+        source_at = src_y * stride
+        destination_at = dst_y * stride
+        copy_bytes = copy_h * stride
+        result[destination_at : destination_at + copy_bytes] = prev[
+            source_at : source_at + copy_bytes
+        ]
+    else:
+        for row in range(copy_h):
+            source_at = (src_y + row) * stride + src_x * FRAME_BYTES
+            destination_at = (dst_y + row) * stride + dst_x * FRAME_BYTES
+            result[destination_at : destination_at + row_bytes] = prev[
+                source_at : source_at + row_bytes
+            ]
     return bytes(result), source, dest
 
 
@@ -266,72 +413,180 @@ def _apc(control: str, payload: str = "", in_tmux: bool = False) -> str:
     return _tmux_wrap(value) if in_tmux else value
 
 
-def build_direct(rgb: bytes, width: int, height: int, columns: int, rows: int,
-                 image_id: int, origin_row: int = 1, origin_column: int = 1,
-                 in_tmux: bool = False) -> str:
+def _compressed_chunks(data: bytes) -> Iterable[tuple[str, int]]:
+    """Yield protocol-sized base64 chunks without retaining a second payload.
+
+    Three raw bytes encode to four base64 characters, so 3072-byte boundaries
+    preserve the exact result of encoding the complete compressed stream while
+    avoiding an additional full-size base64 ``bytes`` and ``str`` pair.
+    """
+    compressed = zlib.compress(data, 1)
+    raw_chunk = CHUNK // 4 * 3
+    for offset in range(0, len(compressed), raw_chunk):
+        payload = base64.b64encode(compressed[offset : offset + raw_chunk]).decode(
+            "ascii"
+        )
+        yield payload, int(offset + raw_chunk < len(compressed))
+
+
+def _image_id(value: object) -> int:
+    return _integer(value, "image_id", minimum=1)
+
+
+def _placement_geometry(
+    width: object,
+    height: object,
+    columns: object,
+    rows: object,
+    origin_row: object = 1,
+    origin_column: object = 1,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        _integer(width, "frame width", minimum=1),
+        _integer(height, "frame height", minimum=1),
+        _integer(columns, "placement columns", minimum=1),
+        _integer(rows, "placement rows", minimum=1),
+        _integer(origin_row, "origin row", minimum=1),
+        _integer(origin_column, "origin column", minimum=1),
+    )
+
+
+def _shared_memory_name(name: object) -> str:
+    if (
+        not isinstance(name, str)
+        or not name.startswith("/")
+        or "/" in name[1:]
+        or "\0" in name
+    ):
+        raise ValueError("shared-memory name must have one leading slash")
+    try:
+        encoded = name.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("shared-memory name must be ASCII") from exc
+    if len(encoded) > 255:
+        raise ValueError("shared-memory name is too long")
+    return name
+
+
+def build_direct(
+    rgb: bytes,
+    width: int,
+    height: int,
+    columns: int,
+    rows: int,
+    image_id: int,
+    origin_row: int = 1,
+    origin_column: int = 1,
+    in_tmux: bool = False,
+) -> str:
     """Build a compressed, chunked inline full-frame placement."""
     if not rgb:
         return ""
-    payload = base64.b64encode(zlib.compress(rgb, 1))
-    chunks = [payload[i:i + CHUNK] for i in range(0, len(payload), CHUNK)]
+    width, height, columns, rows, origin_row, origin_column = _placement_geometry(
+        width, height, columns, rows, origin_row, origin_column
+    )
+    image_id = _image_id(image_id)
+    data = _as_bytes(rgb)
+    expected = width * height * FRAME_BYTES
+    if len(data) != expected:
+        raise ValueError(f"RGB frame length must be {expected}")
     out = [f"\x1b[{origin_row};{origin_column}H"]
-    for index, chunk in enumerate(chunks):
-        more = int(index + 1 < len(chunks))
+    for index, (payload, more) in enumerate(_compressed_chunks(data)):
         if index == 0:
-            control = (f"a=T,i={image_id},p=1,z=-1,t=d,f=24,o=z,N=1,"
-                       f"s={width},v={height},c={columns},r={rows},q=2,C=1,m={more}")
+            control = (
+                f"a=T,i={image_id},p=1,z=-1,t=d,f=24,o=z,N=1,"
+                f"s={width},v={height},c={columns},r={rows},q=2,C=1,m={more}"
+            )
         else:
             control = f"m={more}"
-        out.append(_apc(control, chunk.decode("ascii"), in_tmux))
+        out.append(_apc(control, payload, in_tmux))
     return "".join(out)
 
 
-def build_frame_edit(rgb: bytes, width: int, height: int, x: int, y: int,
-                     image_id: int, in_tmux: bool = False) -> str:
+def build_frame_edit(
+    rgb: bytes,
+    width: int,
+    height: int,
+    x: int,
+    y: int,
+    image_id: int,
+    in_tmux: bool = False,
+) -> str:
     """Build a compressed, chunked inline root-frame edit."""
     if not rgb:
         return ""
-    payload = base64.b64encode(zlib.compress(rgb, 1))
-    chunks = [payload[i:i + CHUNK] for i in range(0, len(payload), CHUNK)]
-    out = []
-    for index, chunk in enumerate(chunks):
-        more = int(index + 1 < len(chunks))
+    x, y, width, height = _rectangle((x, y, width, height), "frame-edit rectangle")
+    image_id = _image_id(image_id)
+    data = _as_bytes(rgb)
+    expected = width * height * FRAME_BYTES
+    if len(data) != expected:
+        raise ValueError(f"RGB frame length must be {expected}")
+    out: list[str] = []
+    for index, (payload, more) in enumerate(_compressed_chunks(data)):
         if index == 0:
-            control = (f"a=f,i={image_id},r=1,x={x},y={y},t=d,f=24,o=z,N=1,"
-                       f"s={width},v={height},q=2,m={more}")
+            control = (
+                f"a=f,i={image_id},r=1,x={x},y={y},t=d,f=24,o=z,N=1,"
+                f"s={width},v={height},q=2,m={more}"
+            )
         else:
             control = f"a=f,i={image_id},r=1,q=2,m={more}"
-        out.append(_apc(control, chunk.decode("ascii"), in_tmux))
+        out.append(_apc(control, payload, in_tmux))
     return "".join(out)
 
 
-def build_full_shm(name: str, width: int, height: int, columns: int, rows: int,
-                   image_id: int, origin_row: int = 1,
-                   origin_column: int = 1) -> str:
+def build_full_shm(
+    name: str,
+    width: int,
+    height: int,
+    columns: int,
+    rows: int,
+    image_id: int,
+    origin_row: int = 1,
+    origin_column: int = 1,
+) -> str:
+    width, height, columns, rows, origin_row, origin_column = _placement_geometry(
+        width, height, columns, rows, origin_row, origin_column
+    )
+    image_id = _image_id(image_id)
+    name = _shared_memory_name(name)
     payload = base64.b64encode(name.encode("ascii")).decode("ascii")
-    return (f"\x1b[{origin_row};{origin_column}H" +
-            _apc(f"a=T,i={image_id},p=1,z=-1,t=s,f=24,N=1,s={width},v={height},"
-                 f"c={columns},r={rows},q=2,C=1", payload))
+    return f"\x1b[{origin_row};{origin_column}H" + _apc(
+        f"a=T,i={image_id},p=1,z=-1,t=s,f=24,N=1,s={width},v={height},"
+        f"c={columns},r={rows},q=2,C=1",
+        payload,
+    )
 
 
-def build_frame_edit_shm(name: str, width: int, height: int, x: int, y: int,
-                         image_id: int) -> str:
+def build_frame_edit_shm(
+    name: str, width: int, height: int, x: int, y: int, image_id: int
+) -> str:
+    name = _shared_memory_name(name)
+    x, y, width, height = _rectangle((x, y, width, height), "frame-edit rectangle")
+    image_id = _image_id(image_id)
     payload = base64.b64encode(name.encode("ascii")).decode("ascii")
-    return _apc(f"a=f,i={image_id},r=1,x={x},y={y},t=s,f=24,N=1,"
-                f"s={width},v={height},q=2", payload)
+    return _apc(
+        f"a=f,i={image_id},r=1,x={x},y={y},t=s,f=24,N=1,s={width},v={height},q=2",
+        payload,
+    )
 
 
-def build_compose(image_id: int, source: Rect, destination: Rect,
-                  in_tmux: bool = False) -> str:
+def build_compose(
+    image_id: int, source: Rect, destination: Rect, in_tmux: bool = False
+) -> str:
     """Build the Kilix-fork overlapping root-frame replacement command."""
-    sx, sy, sw, sh = source
-    dx, dy, dw, dh = destination
+    image_id = _image_id(image_id)
+    sx, sy, sw, sh = _rectangle(source, "compose source")
+    dx, dy, dw, dh = _rectangle(destination, "compose destination")
     if (sw, sh) != (dw, dh):
         raise ValueError("compose source and destination sizes differ")
     # N=2 opts into the fork's safe same-frame-overlap extension.  Stock Kitty
     # retains the protocol-mandated EINVAL behavior for overlap.
-    return _apc(f"a=c,i={image_id},r=1,c=1,x={dx},y={dy},X={sx},Y={sy},"
-                f"w={sw},h={sh},C=1,N=2,q=2", "", in_tmux)
+    return _apc(
+        f"a=c,i={image_id},r=1,c=1,x={dx},y={dy},X={sx},Y={sy},"
+        f"w={sw},h={sh},C=1,N=2,q=2",
+        "",
+        in_tmux,
+    )
 
 
 class ShmBusy(RuntimeError):
@@ -342,7 +597,7 @@ class ShmBusy(RuntimeError):
 class _ShmSlot:
     name: str
     fd: int = -1
-    mapping: Optional[mmap.mmap] = None
+    mapping: mmap.mmap | None = None
     busy: bool = False
 
 
@@ -356,8 +611,9 @@ class PosixShmRing:
     """
 
     def __init__(self, slots: int = 3, prefix: str = "kitty-frame-presenter"):
-        if slots < 1:
-            raise ValueError("slots must be positive")
+        slots = _integer(slots, "slots", minimum=1, maximum=_MAX_SHM_SLOTS)
+        if not isinstance(prefix, str):
+            raise ValueError("shared-memory prefix must be a string")
         libc_name = ctypes.util.find_library("c")
         if not libc_name:
             raise OSError(errno.ENOSYS, "C library not found")
@@ -367,9 +623,14 @@ class PosixShmRing:
         self._libc.shm_unlink.argtypes = [ctypes.c_char_p]
         self._libc.shm_unlink.restype = ctypes.c_int
         token = secrets.token_hex(6)
-        base = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in prefix)
-        self._slots = [_ShmSlot(f"/{base}-{os.getpid()}-{token}-{i}")
-                       for i in range(slots)]
+        base = "".join(
+            ch if ch.isascii() and (ch.isalnum() or ch in "-_") else "-"
+            for ch in prefix
+        ).strip("-")
+        base = (base or "kitty-frame-presenter")[:192]
+        self._slots = [
+            _ShmSlot(f"/{base}-{os.getpid()}-{token}-{i}") for i in range(slots)
+        ]
         self.closed = False
 
     def _open(self, name: str, flags: int, mode: int = 0o600) -> int:
@@ -377,7 +638,7 @@ class PosixShmRing:
         if fd < 0:
             value = ctypes.get_errno()
             raise OSError(value, os.strerror(value), name)
-        return fd
+        return int(fd)
 
     def _unlink(self, name: str, missing_ok: bool = True) -> None:
         if self._libc.shm_unlink(name.encode("ascii")) != 0:
@@ -387,11 +648,22 @@ class PosixShmRing:
 
     @staticmethod
     def _release(slot: _ShmSlot) -> None:
-        if slot.mapping is not None:
-            slot.mapping.close()
-        if slot.fd >= 0:
-            os.close(slot.fd)
+        mapping, descriptor = slot.mapping, slot.fd
         slot.mapping, slot.fd, slot.busy = None, -1, False
+        error: Exception | None = None
+        if mapping is not None:
+            try:
+                mapping.close()
+            except (BufferError, OSError) as exc:
+                error = exc
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
 
     def reap(self) -> int:
         """Release slots whose names Kitty has unlinked; return free count."""
@@ -420,7 +692,7 @@ class PosixShmRing:
         self.reap()
         return sum(slot.busy for slot in self._slots)
 
-    def put_many(self, payloads: Sequence[bytes]) -> Tuple[str, ...]:
+    def put_many(self, payloads: Sequence[bytes]) -> tuple[str, ...]:
         if self.closed:
             raise RuntimeError("shared-memory ring is closed")
         if not payloads:
@@ -429,34 +701,53 @@ class PosixShmRing:
         free = [slot for slot in self._slots if not slot.busy]
         if len(free) < len(payloads):
             raise ShmBusy("shared-memory ring is saturated")
-        made = []
+        made: list[_ShmSlot] = []
         try:
             for slot, payload in zip(free, payloads):
                 data = _as_bytes(payload)
                 if not data:
                     raise ValueError("shared-memory payload cannot be empty")
                 fd = -1
-                mapping = None
+                mapping: mmap.mmap | None = None
+                created = False
                 try:
-                    fd = self._open(
-                        slot.name, os.O_RDWR | os.O_CREAT | os.O_EXCL)
+                    fd = self._open(slot.name, os.O_RDWR | os.O_CREAT | os.O_EXCL)
+                    created = True
                     os.ftruncate(fd, len(data))
                     mapping = mmap.mmap(fd, len(data), access=mmap.ACCESS_WRITE)
                     mapping[:] = data
-                except Exception:
+                except BaseException:
                     if mapping is not None:
-                        mapping.close()
+                        try:
+                            mapping.close()
+                        except (BufferError, OSError):
+                            pass
                     if fd >= 0:
-                        os.close(fd)
-                    self._unlink(slot.name)
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                    # Never unlink an object whose O_EXCL open failed: that
+                    # name belongs to another producer.
+                    if created:
+                        try:
+                            self._unlink(slot.name)
+                        except OSError:
+                            pass
                     raise
                 slot.fd, slot.mapping, slot.busy = fd, mapping, True
                 made.append(slot)
             return tuple(slot.name for slot in made)
-        except Exception:
+        except BaseException:
             for slot in made:
-                self._unlink(slot.name)
-                self._release(slot)
+                try:
+                    self._unlink(slot.name)
+                except OSError:
+                    pass
+                try:
+                    self._release(slot)
+                except (BufferError, OSError):
+                    pass
             raise
 
     def close(self, *, discard: bool = False) -> None:
@@ -469,17 +760,28 @@ class PosixShmRing:
         """
         if self.closed:
             return
+        error: Exception | None = None
         for slot in self._slots:
             if slot.busy:
                 if discard:
-                    self._unlink(slot.name)
-                self._release(slot)
+                    try:
+                        self._unlink(slot.name)
+                    except OSError as exc:
+                        if error is None:
+                            error = exc
+                try:
+                    self._release(slot)
+                except (BufferError, OSError) as exc:
+                    if error is None:
+                        error = exc
         self.closed = True
+        if error is not None:
+            raise error
 
-    def __enter__(self):
+    def __enter__(self) -> PosixShmRing:
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, *_: object) -> None:
         self.close()
 
 
@@ -497,15 +799,14 @@ class PresenterStats:
     latency_samples: int = 0
     latency_total_ms: float = 0.0
     latency_max_ms: float = 0.0
-    latencies_ms: Deque[float] = field(
-        default_factory=lambda: deque(maxlen=256))
+    latencies_ms: deque[float] = field(default_factory=lambda: deque(maxlen=256))
 
 
 @dataclass(frozen=True)
 class PresentResult:
     kind: str
     emitted: bool = False
-    rects: Tuple[Rect, ...] = ()
+    rects: tuple[Rect, ...] = ()
     pixel_bytes: int = 0
     wire_bytes: int = 0
 
@@ -524,7 +825,7 @@ class TappedFrame:
     height: int
     columns: int
     rows: int
-    scroll: Optional[Tuple[int, int]]
+    scroll: tuple[int, int] | None
     content_key: object
     offered_at: float
 
@@ -543,33 +844,60 @@ class FrameSocketTap:
     _VERSION = 1
     _FRAME_MAX = 64 * 1024 * 1024
 
-    def __init__(self, path: str, session: str, *,
-                 retry_seconds: float = 1.0,
-                 send_timeout: float = 0.5):
-        encoded_session = session.encode("ascii")
-        if not os.path.isabs(path):
+    def __init__(
+        self,
+        path: str,
+        session: str,
+        *,
+        retry_seconds: float = 1.0,
+        send_timeout: float = 0.5,
+    ):
+        if not isinstance(path, str) or "\0" in path or not os.path.isabs(path):
             raise ValueError("frame tap socket path must be absolute")
-        if not encoded_session or len(encoded_session) > 64 or b"\0" in encoded_session:
-            raise ValueError("frame tap session must be 1 to 64 ASCII bytes")
+        try:
+            encoded_path = os.fsencode(path)
+        except UnicodeError as exc:
+            raise ValueError("frame tap socket path is not encodable") from exc
+        if len(encoded_path) > _UNIX_SOCKET_PATH_BYTES:
+            raise ValueError("frame tap socket path is too long")
+        if (
+            not isinstance(session, str)
+            or not session
+            or len(session) > 64
+            or any(character not in _SESSION_CHARACTERS for character in session)
+        ):
+            raise ValueError("frame tap session must be 1 to 64 safe ASCII characters")
+        encoded_session = session.encode("ascii")
         self.path = path
         self.session = encoded_session
-        self.retry_seconds = max(0.05, float(retry_seconds))
-        self.send_timeout = max(0.05, float(send_timeout))
+        self.retry_seconds = _number(
+            retry_seconds,
+            "frame tap retry interval",
+            minimum=0.05,
+            maximum=_MAX_TAP_RETRY_SECONDS,
+        )
+        self.send_timeout = _number(
+            send_timeout,
+            "frame tap send timeout",
+            minimum=0.05,
+            maximum=_MAX_TAP_SEND_TIMEOUT,
+        )
         self.frames_offered = 0
         self.frames_sent = 0
         self.frames_dropped = 0
         self.failures = 0
         self._condition = threading.Condition()
-        self._pending: Optional[TappedFrame] = None
+        self._pending: TappedFrame | None = None
         self._closed = False
-        self._socket: Optional[socket.socket] = None
+        self._socket: socket.socket | None = None
         self._retry_at = float("-inf")
         self._thread = threading.Thread(
-            target=self._run, name="kitty-frame-tap", daemon=True)
+            target=self._run, name="kitty-frame-tap", daemon=True
+        )
         self._thread.start()
 
     @classmethod
-    def from_environment(cls) -> Optional["FrameSocketTap"]:
+    def from_environment(cls) -> FrameSocketTap | None:
         """Create the explicitly configured tap, or return ``None``.
 
         The shared package never enables discovery by itself.  A host such as
@@ -587,78 +915,124 @@ class FrameSocketTap:
         return cls(path, session)
 
     def __call__(self, frame: TappedFrame) -> None:
+        try:
+            rgb = _as_bytes(frame.rgb)
+        except ValueError as exc:
+            raise ValueError("invalid RGB frame for socket tap") from exc
         geometry = (frame.width, frame.height, frame.columns, frame.rows)
         if any(type(value) is not int for value in geometry):
             raise ValueError("frame geometry must contain integers")
         expected = frame.width * frame.height * FRAME_BYTES
-        if (frame.width <= 0 or frame.height <= 0 or
-                frame.width > 8192 or frame.height > 8192 or
-                frame.columns <= 0 or frame.rows <= 0 or
-                frame.columns > 10000 or frame.rows > 10000 or
-                len(frame.rgb) != expected or expected > self._FRAME_MAX):
+        if (
+            frame.width <= 0
+            or frame.height <= 0
+            or frame.width > 8192
+            or frame.height > 8192
+            or frame.columns <= 0
+            or frame.rows <= 0
+            or frame.columns > 10000
+            or frame.rows > 10000
+            or len(rgb) != expected
+            or expected > self._FRAME_MAX
+        ):
             raise ValueError("invalid RGB frame for socket tap")
-        if (type(frame.offered_at) not in (int, float) or
-                not math.isfinite(frame.offered_at) or
-                frame.offered_at < 0 or
-                frame.offered_at * 1_000_000 >= 1 << 64):
+        if type(frame.offered_at) not in (int, float):
             raise ValueError("invalid frame time for socket tap")
+        try:
+            offered_at = _time_value(frame.offered_at)
+        except ValueError as exc:
+            raise ValueError("invalid frame time for socket tap") from exc
         if frame.scroll is not None:
-            if (len(frame.scroll) != 2 or
-                    any(type(value) is not int for value in frame.scroll)):
-                raise ValueError("invalid scroll hint for socket tap")
-            scroll_x, scroll_y = frame.scroll
-            if not (-(1 << 31) <= scroll_x < 1 << 31 and
-                    -(1 << 31) <= scroll_y < 1 << 31):
-                raise ValueError("invalid scroll hint for socket tap")
+            try:
+                scroll = _scroll_hint(frame.scroll)
+            except ValueError as exc:
+                raise ValueError("invalid scroll hint for socket tap") from exc
+            frame_scroll: tuple[int, int] | None = scroll
+        else:
+            frame_scroll = None
+        normalized = TappedFrame(
+            rgb=rgb,
+            width=frame.width,
+            height=frame.height,
+            columns=frame.columns,
+            rows=frame.rows,
+            scroll=frame_scroll,
+            content_key=frame.content_key,
+            offered_at=offered_at,
+        )
         with self._condition:
             if self._closed:
                 return
             self.frames_offered += 1
             if self._pending is not None:
                 self.frames_dropped += 1
-            self._pending = frame
+            self._pending = normalized
             self._condition.notify()
 
     @staticmethod
-    def _scroll(frame: TappedFrame) -> Tuple[int, int]:
+    def _scroll(frame: TappedFrame) -> tuple[int, int]:
         if frame.scroll is None:
             # INT32_MIN means that no producer hint was supplied.
-            return -(1 << 31), -(1 << 31)
-        return int(frame.scroll[0]), int(frame.scroll[1])
+            return _INT32_MIN, _INT32_MIN
+        return frame.scroll
 
     def _encode_header(self, frame: TappedFrame) -> bytes:
         scroll_x, scroll_y = self._scroll(frame)
         return self._HEADER.pack(
-            b"KFT1", self._VERSION, 0,
+            b"KFT1",
+            self._VERSION,
+            0,
             self.session.ljust(64, b"\0"),
-            frame.width, frame.height, frame.columns, frame.rows,
-            scroll_x, scroll_y,
+            frame.width,
+            frame.height,
+            frame.columns,
+            frame.rows,
+            scroll_x,
+            scroll_y,
             max(0, int(frame.offered_at * 1_000_000)),
             len(frame.rgb),
         )
 
     def _disconnect(self) -> None:
-        sock, self._socket = self._socket, None
+        with self._condition:
+            sock, self._socket = self._socket, None
         if sock is not None:
             try:
                 sock.close()
             except OSError:
                 pass
 
+    @staticmethod
+    def _peer_is_owner(sock: socket.socket) -> bool:
+        if not hasattr(socket, "SO_PEERCRED"):
+            return True
+        size = struct.calcsize("3i")
+        credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, size)
+        _pid, uid, _gid = struct.unpack("3i", credentials)
+        return bool(uid == os.geteuid())
+
     def _connect(self) -> bool:
         now = time.monotonic()
         if now < self._retry_at:
             return False
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(self.send_timeout)
+        sock: socket.socket | None = None
         try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(self.send_timeout)
             sock.connect(self.path)
+            if not self._peer_is_owner(sock):
+                raise PermissionError("frame tap peer has a different owner")
         except OSError:
-            sock.close()
+            if sock is not None:
+                sock.close()
             self.failures += 1
             self._retry_at = now + self.retry_seconds
             return False
-        self._socket = sock
+        with self._condition:
+            if self._closed:
+                sock.close()
+                return False
+            self._socket = sock
         self._retry_at = float("-inf")
         return True
 
@@ -675,7 +1049,11 @@ class FrameSocketTap:
             if self._socket is None and not self._connect():
                 self.frames_dropped += 1
                 continue
-            sock = self._socket
+            with self._condition:
+                sock = self._socket
+                closed = self._closed
+            if closed:
+                break
             if sock is None:
                 self.frames_dropped += 1
                 continue
@@ -700,7 +1078,14 @@ class FrameSocketTap:
                 self._pending = None
             self._condition.notify()
         self._disconnect()
-        self._thread.join(timeout=self.send_timeout + 0.25)
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=self.send_timeout + 0.25)
+
+    def __enter__(self) -> FrameSocketTap:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 @dataclass
@@ -714,49 +1099,74 @@ class _Request:
     origin_column: int
     content_key: object
     force_full: bool
-    scroll: Optional[Tuple[int, int]]
+    scroll: tuple[int, int] | None
     offered_at: float
 
 
 class FramePresenter:
     """Stateful, newest-frame-wins Kitty RGB presenter."""
 
-    def __init__(self, terminal, image_id: int = 1, *, stream: bool = False,
-                 in_tmux: bool = False, max_fps: float = 0,
-                 shm_slots: int = 3, enable_scroll: Optional[bool] = None,
-                 stream_keyframe_seconds: float = 5.0,
-                 stream_warmup_seconds: float = 4.0,
-                 tap=None,
-                 clock=time.monotonic):
-        if image_id <= 0:
-            raise ValueError("image_id must be positive")
+    def __init__(
+        self,
+        terminal: TerminalWriter,
+        image_id: int = 1,
+        *,
+        stream: bool = False,
+        in_tmux: bool = False,
+        max_fps: float = 0,
+        shm_slots: int = 3,
+        enable_scroll: bool | None = None,
+        stream_keyframe_seconds: float = 5.0,
+        stream_warmup_seconds: float = 4.0,
+        tap: Callable[[TappedFrame], object] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        image_id = _image_id(image_id)
+        if not callable(getattr(terminal, "write", None)):
+            raise ValueError("terminal must provide write(str)")
+        if not callable(clock):
+            raise ValueError("clock must be callable")
         self.terminal = terminal
         self.image_id = image_id
-        self.stream = stream
-        self.in_tmux = in_tmux
-        self.max_fps = max(0.0, float(max_fps))
+        self.stream = bool(stream)
+        self.in_tmux = bool(in_tmux)
+        self.max_fps = _number(max_fps, "max_fps")
         self.frame_interval = 1.0 / self.max_fps if self.max_fps else 0.0
-        self.enable_scroll = (os.environ.get("KITTY_KILIX_RENDERING") == "1"
-                              if enable_scroll is None else bool(enable_scroll))
-        self.stream_keyframe_seconds = max(0.0, stream_keyframe_seconds)
-        self.stream_warmup_seconds = max(0.0, stream_warmup_seconds)
+        if not math.isfinite(self.frame_interval):
+            raise ValueError("max_fps is too small to produce a finite interval")
+        self.enable_scroll = (
+            os.environ.get("KITTY_KILIX_RENDERING") == "1"
+            if enable_scroll is None
+            else bool(enable_scroll)
+        )
+        self.stream_keyframe_seconds = _number(
+            stream_keyframe_seconds, "stream keyframe interval"
+        )
+        self.stream_warmup_seconds = _number(
+            stream_warmup_seconds, "stream warmup interval"
+        )
         self.clock = clock
-        self.started_at = clock()
+        self.started_at = _time_value(clock(), "clock result")
         self._last_emit_at = float("-inf")
         self._last_full_at = float("-inf")
-        self._base_signature = None
-        self._previous = None
-        self._pending: Optional[_Request] = None
+        self._busy_retry_at = float("-inf")
+        self._base_signature: tuple[int, int, int, int, int, int, object] | None = None
+        self._previous: bytes | None = None
+        self._pending: _Request | None = None
         self.tap = tap
         self.tap_failures = 0
         self.stats = PresenterStats()
-        self.shm = None if stream else PosixShmRing(shm_slots)
+        self.shm = None if self.stream else PosixShmRing(shm_slots)
+        self.closed = False
 
     @property
-    def next_deadline(self) -> Optional[float]:
+    def next_deadline(self) -> float | None:
         if self._pending is None:
             return None
-        return self._last_emit_at + self.frame_interval
+        return max(
+            self._last_emit_at + self.frame_interval,
+            self._busy_retry_at,
+        )
 
     def invalidate(self) -> None:
         # A queued request describes the old placement.  Sending it after a
@@ -768,27 +1178,75 @@ class FramePresenter:
         self._base_signature = None
         self._previous = None
 
-    def _request(self, rgb, width, height, columns, rows, origin_row,
-                 origin_column, content_key, force_full, scroll, offered_at):
+    def _request(
+        self,
+        rgb: object,
+        width: object,
+        height: object,
+        columns: object,
+        rows: object,
+        origin_row: object,
+        origin_column: object,
+        content_key: object,
+        force_full: object,
+        scroll: object,
+        offered_at: object,
+    ) -> _Request:
+        width, height, columns, rows, origin_row, origin_column = _placement_geometry(
+            width, height, columns, rows, origin_row, origin_column
+        )
         data = _as_bytes(rgb)
         expected = width * height * FRAME_BYTES
-        if width <= 0 or height <= 0 or len(data) != expected:
+        if len(data) != expected:
             raise ValueError(f"RGB frame length must be {expected} bytes")
-        if columns <= 0 or rows <= 0 or origin_row <= 0 or origin_column <= 0:
-            raise ValueError("placement geometry must be positive")
         if scroll is not None:
-            scroll = (int(scroll[0]), int(scroll[1]))
-        return _Request(data, width, height, columns, rows, origin_row,
-                        origin_column, content_key, force_full, scroll, offered_at)
+            scroll = _scroll_hint(scroll)
+        return _Request(
+            data,
+            width,
+            height,
+            columns,
+            rows,
+            origin_row,
+            origin_column,
+            content_key,
+            bool(force_full),
+            scroll,
+            _time_value(offered_at),
+        )
 
-    def present(self, rgb, width: int, height: int, columns: int, rows: int,
-                *, origin_row: int = 1, origin_column: int = 1,
-                content_key=None, force_full: bool = False,
-                scroll: Optional[Tuple[int, int]] = None,
-                now: Optional[float] = None) -> PresentResult:
+    def present(
+        self,
+        rgb: object,
+        width: int,
+        height: int,
+        columns: int,
+        rows: int,
+        *,
+        origin_row: int = 1,
+        origin_column: int = 1,
+        content_key: object = None,
+        force_full: bool = False,
+        scroll: tuple[int, int] | None = None,
+        now: float | None = None,
+    ) -> PresentResult:
+        if self.closed:
+            raise RuntimeError("frame presenter is closed")
         now = self.clock() if now is None else now
-        request = self._request(rgb, width, height, columns, rows, origin_row,
-                                origin_column, content_key, force_full, scroll, now)
+        request = self._request(
+            rgb,
+            width,
+            height,
+            columns,
+            rows,
+            origin_row,
+            origin_column,
+            content_key,
+            force_full,
+            scroll,
+            now,
+        )
+        now = request.offered_at
         self.stats.frames_offered += 1
         self._offer_to_tap(request)
         if self._pending is not None:
@@ -800,6 +1258,7 @@ class FramePresenter:
         result = self._emit(request, now)
         if result.kind == "busy":
             self._pending = request
+            self._busy_retry_at = now + _SHM_RETRY_SECONDS
             return PresentResult("queued")
         return result
 
@@ -816,60 +1275,96 @@ class FramePresenter:
         if self.tap is None:
             return
         try:
-            self.tap(TappedFrame(
-                rgb=request.rgb,
-                width=request.width,
-                height=request.height,
-                columns=request.columns,
-                rows=request.rows,
-                scroll=request.scroll,
-                content_key=request.content_key,
-                offered_at=request.offered_at,
-            ))
+            self.tap(
+                TappedFrame(
+                    rgb=request.rgb,
+                    width=request.width,
+                    height=request.height,
+                    columns=request.columns,
+                    rows=request.rows,
+                    scroll=request.scroll,
+                    content_key=request.content_key,
+                    offered_at=request.offered_at,
+                )
+            )
+        # A secondary sink cannot break the primary presentation path.
         except Exception:
             self.tap_failures += 1
             self.tap = None
 
-    def flush(self, now: Optional[float] = None) -> PresentResult:
+    def flush(self, now: float | None = None) -> PresentResult:
         if self._pending is None:
             if self.shm is not None:
                 self.shm.reap()
             return PresentResult("idle")
-        now = self.clock() if now is None else now
-        if now < self._last_emit_at + self.frame_interval:
+        now = _time_value(self.clock() if now is None else now)
+        deadline = self.next_deadline
+        if deadline is not None and now < deadline:
             return PresentResult("queued")
         request = self._pending
         result = self._emit(request, now)
         if result.kind != "busy":
             self._pending = None
+        else:
+            self._busy_retry_at = now + _SHM_RETRY_SECONDS
         return PresentResult("queued") if result.kind == "busy" else result
 
     def _full_required(self, request: _Request, now: float) -> bool:
-        signature = (request.width, request.height, request.columns, request.rows,
-                     request.origin_row, request.origin_column, request.content_key)
+        signature = (
+            request.width,
+            request.height,
+            request.columns,
+            request.rows,
+            request.origin_row,
+            request.origin_column,
+            request.content_key,
+        )
         if request.force_full or signature != self._base_signature:
             return True
         if self.stream:
-            if now - self.started_at < self.stream_warmup_seconds:
+            if (
+                self.stream_warmup_seconds
+                and now - self.started_at < self.stream_warmup_seconds
+            ):
                 return True
-            if self.stream_keyframe_seconds and now - self._last_full_at >= self.stream_keyframe_seconds:
+            if (
+                self.stream_keyframe_seconds
+                and now - self._last_full_at >= self.stream_keyframe_seconds
+            ):
                 return True
         return False
 
     def _write(self, sequence: str) -> int:
         if sequence:
             self.terminal.write(sequence)
-        return len(sequence.encode("utf-8"))
+        # Every sequence assembled here is ASCII.  Encoding it solely to count
+        # wire bytes doubled peak storage for large inline frames.
+        return len(sequence)
 
-    def _finish(self, request: _Request, now: float, kind: str,
-                rects: Iterable[Rect], pixel_bytes: int, wire_bytes: int,
-                full: bool = False, scroll: bool = False) -> PresentResult:
+    def _finish(
+        self,
+        request: _Request,
+        now: float,
+        kind: str,
+        rects: Iterable[Rect],
+        pixel_bytes: int,
+        wire_bytes: int,
+        full: bool = False,
+        scroll: bool = False,
+    ) -> PresentResult:
         rect_tuple = tuple(rects)
         self._previous = request.rgb
         self._base_signature = (
-            request.width, request.height, request.columns, request.rows,
-            request.origin_row, request.origin_column, request.content_key)
+            request.width,
+            request.height,
+            request.columns,
+            request.rows,
+            request.origin_row,
+            request.origin_column,
+            request.content_key,
+        )
         self._last_emit_at = now
+        self._busy_retry_at = float("-inf")
         if full:
             self._last_full_at = now
             self.stats.full_frames += 1
@@ -888,44 +1383,88 @@ class FramePresenter:
     def _emit_full(self, request: _Request, now: float) -> PresentResult:
         if self.stream:
             sequence = build_direct(
-                request.rgb, request.width, request.height,
-                request.columns, request.rows, self.image_id,
-                request.origin_row, request.origin_column, self.in_tmux)
+                request.rgb,
+                request.width,
+                request.height,
+                request.columns,
+                request.rows,
+                self.image_id,
+                request.origin_row,
+                request.origin_column,
+                self.in_tmux,
+            )
         else:
+            shm = self.shm
+            if shm is None:
+                raise RuntimeError("local presenter has no shared-memory transport")
             try:
-                name = self.shm.put_many((request.rgb,))[0]
+                name = shm.put_many((request.rgb,))[0]
             except ShmBusy:
                 return PresentResult("busy")
             sequence = build_full_shm(
-                name, request.width, request.height, request.columns,
-                request.rows, self.image_id, request.origin_row,
-                request.origin_column)
+                name,
+                request.width,
+                request.height,
+                request.columns,
+                request.rows,
+                self.image_id,
+                request.origin_row,
+                request.origin_column,
+            )
         wire = self._write(_SYNC_BEGIN + sequence + _SYNC_END)
-        return self._finish(request, now, "full", (), len(request.rgb), wire,
-                            full=True)
+        return self._finish(request, now, "full", (), len(request.rgb), wire, full=True)
 
-    def _emit_rects(self, request: _Request, now: float,
-                    rects: Sequence[Rect], prefix: str = "",
-                    kind: str = "rect", scrolled: bool = False) -> PresentResult:
-        payloads = tuple(extract_rect(request.rgb, request.width,
-                                      request.height, rect) for rect in rects)
+    def _emit_rects(
+        self,
+        request: _Request,
+        now: float,
+        rects: Sequence[Rect],
+        prefix: str = "",
+        kind: str = "rect",
+        scrolled: bool = False,
+    ) -> PresentResult:
+        payloads = tuple(
+            extract_rect(request.rgb, request.width, request.height, rect)
+            for rect in rects
+        )
         if self.stream:
-            edits = "".join(build_frame_edit(
-                payload, rect[2], rect[3], rect[0], rect[1], self.image_id,
-                self.in_tmux) for payload, rect in zip(payloads, rects))
+            edits = "".join(
+                build_frame_edit(
+                    payload,
+                    rect[2],
+                    rect[3],
+                    rect[0],
+                    rect[1],
+                    self.image_id,
+                    self.in_tmux,
+                )
+                for payload, rect in zip(payloads, rects)
+            )
         else:
+            shm = self.shm
+            if shm is None:
+                raise RuntimeError("local presenter has no shared-memory transport")
             try:
-                names = self.shm.put_many(payloads)
+                names = shm.put_many(payloads)
             except ShmBusy:
                 return PresentResult("busy")
-            edits = "".join(build_frame_edit_shm(
-                name, rect[2], rect[3], rect[0], rect[1], self.image_id)
-                for name, rect in zip(names, rects))
+            edits = "".join(
+                build_frame_edit_shm(
+                    name, rect[2], rect[3], rect[0], rect[1], self.image_id
+                )
+                for name, rect in zip(names, rects)
+            )
         wire = self._write(_SYNC_BEGIN + prefix + edits + _SYNC_END)
-        return self._finish(request, now, kind, rects,
-                            sum(map(len, payloads)), wire, scroll=scrolled)
+        return self._finish(
+            request, now, kind, rects, sum(map(len, payloads)), wire, scroll=scrolled
+        )
 
-    def _scroll_candidate(self, request: _Request, normal: Rect):
+    def _scroll_candidate(
+        self, request: _Request, normal: Rect
+    ) -> tuple[Rect, Rect, tuple[Rect, ...]] | None:
+        previous = self._previous
+        if previous is None:
+            return None
         shift = request.scroll
         if shift is None:
             # Cursor/caret-sized damage cannot be a useful screen scroll.  The
@@ -936,18 +1475,28 @@ class FramePresenter:
             frame_area = request.width * request.height
             if normal_area < frame_area * 0.20:
                 return None
-            shift = detect_vertical_scroll(self._previous, request.rgb,
-                                           request.width, request.height)
+            shift = detect_vertical_scroll(
+                previous, request.rgb, request.width, request.height
+            )
         if not shift or shift == (0, 0):
             return None
         dx, dy = shift
         try:
             predicted, source, destination = _shift_prediction(
-                self._previous, request.width, request.height, dx, dy)
+                previous, request.width, request.height, dx, dy
+            )
         except ValueError:
             return None
-        residual = diff_rects(predicted, request.rgb, request.width,
-                              request.height, max_rects=2)
+        max_rects = 2
+        if self.shm is not None:
+            max_rects = min(max_rects, self.shm.capacity)
+        residual = diff_rects(
+            predicted,
+            request.rgb,
+            request.width,
+            request.height,
+            max_rects=max_rects,
+        )
         normal_area = normal[2] * normal[3]
         residual_area = sum(rect[2] * rect[3] for rect in residual)
         # Composition is worthwhile only when it materially reduces copied
@@ -959,8 +1508,7 @@ class FramePresenter:
     def _emit(self, request: _Request, now: float) -> PresentResult:
         if self._full_required(request, now) or self._previous is None:
             return self._emit_full(request, now)
-        normal = diff_rect(self._previous, request.rgb,
-                           request.width, request.height)
+        normal = diff_rect(self._previous, request.rgb, request.width, request.height)
         if normal is None:
             self._previous = request.rgb
             self.stats.frames_unchanged += 1
@@ -969,23 +1517,33 @@ class FramePresenter:
             candidate = self._scroll_candidate(request, normal)
             if candidate is not None:
                 source, destination, residual = candidate
-                compose = build_compose(self.image_id, source, destination,
-                                        self.in_tmux)
+                compose = build_compose(
+                    self.image_id, source, destination, self.in_tmux
+                )
                 if not residual:
                     wire = self._write(_SYNC_BEGIN + compose + _SYNC_END)
-                    return self._finish(request, now, "scroll", (), 0, wire,
-                                        scroll=True)
-                return self._emit_rects(request, now, residual, compose,
-                                        "scroll", scrolled=True)
+                    return self._finish(
+                        request, now, "scroll", (), 0, wire, scroll=True
+                    )
+                return self._emit_rects(
+                    request, now, residual, compose, "scroll", scrolled=True
+                )
         return self._emit_rects(request, now, (normal,))
 
     def close(self, *, discard: bool = False) -> None:
-        self._pending = None
-        if self.shm is not None:
-            self.shm.close(discard=discard)
+        if self.closed:
+            return
+        if self._pending is not None:
+            self.stats.frames_dropped += 1
+            self._pending = None
+        try:
+            if self.shm is not None:
+                self.shm.close(discard=discard)
+        finally:
+            self.closed = True
 
-    def __enter__(self):
+    def __enter__(self) -> FramePresenter:
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, *_: object) -> None:
         self.close()

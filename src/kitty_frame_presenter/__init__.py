@@ -11,11 +11,11 @@ chunked inline data.
 from .presenter import (
     CHUNK,
     FRAME_BYTES,
-    FrameSocketTap,
     FramePresenter,
-    PresentResult,
-    PresenterStats,
+    FrameSocketTap,
     PosixShmRing,
+    PresenterStats,
+    PresentResult,
     ShmBusy,
     TappedFrame,
     build_compose,
@@ -30,6 +30,8 @@ from .presenter import (
     extract_rect,
     wrap_tmux_passthrough,
 )
+
+__version__ = "0.2.0"
 
 __all__ = [
     "CHUNK",
