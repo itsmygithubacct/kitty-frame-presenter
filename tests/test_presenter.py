@@ -32,6 +32,7 @@ from kitty_frame_presenter import (
     build_full_shm,
     detect_vertical_scroll,
     diff_band,
+    diff_damage_rects,
     diff_rect,
     diff_rects,
     extract_rect,
@@ -162,6 +163,41 @@ class DamageTests(unittest.TestCase):
         self.assertEqual(
             diff_rects(before, after, width, height), ((0, 0, 1, 1), (19, 19, 1, 1))
         )
+
+    def test_damage_hints_scan_and_shrink_disjoint_regions(self):
+        width, height = 20, 12
+        before = frame(width, height)
+        after = bytearray(before)
+        for x, y, color in ((2, 3, b"\xff\0\0"), (17, 9, b"\0\xff\0")):
+            at = (y * width + x) * 3
+            after[at : at + 3] = color
+        self.assertEqual(
+            diff_damage_rects(
+                before,
+                bytes(after),
+                width,
+                height,
+                ((0, 1, 6, 5), (14, 7, 6, 5)),
+            ),
+            ((2, 3, 1, 1), (17, 9, 1, 1)),
+        )
+        self.assertEqual(
+            diff_damage_rects(before, before, width, height, ()),
+            (),
+        )
+
+    def test_damage_hints_validate_bounds_shape_and_count(self):
+        pixels = frame(2, 2)
+        invalid = (
+            None,
+            (0, 0, 3, 1),
+            (0, 0, 0, 1),
+            object(),
+            ((0, 0, 1, 1),) * 65,
+        )
+        for damage in invalid:
+            with self.subTest(damage=damage), self.assertRaises(ValueError):
+                diff_damage_rects(pixels, pixels, 2, 2, damage)
 
     def test_bad_sizes_are_full_damage_in_compat_helper(self):
         self.assertEqual(diff_band(b"x", b"y", 10, 5), (0, 5))
@@ -517,6 +553,64 @@ class PresenterTests(unittest.TestCase):
         finally:
             presenter.close()
 
+    def test_trusted_damage_bypasses_full_frame_diff_and_emits_multiple_rects(self):
+        width, height = 12, 8
+        before = frame(width, height)
+        after = bytearray(before)
+        changes = ((2, 1, b"\xff\0\0"), (10, 6, b"\0\xff\0"))
+        for x, y, color in changes:
+            at = (y * width + x) * 3
+            after[at : at + 3] = color
+        terminal = ModelTerm()
+        presenter = FramePresenter(
+            terminal,
+            stream=True,
+            enable_scroll=False,
+            stream_warmup_seconds=0,
+            stream_keyframe_seconds=0,
+        )
+        try:
+            presenter.present(before, width, height, 6, 4, now=1.0)
+            with mock.patch.object(
+                presenter_module,
+                "diff_rect",
+                side_effect=AssertionError("full-frame diff was used"),
+            ):
+                result = presenter.present(
+                    bytes(after),
+                    width,
+                    height,
+                    6,
+                    4,
+                    damage=((0, 0, 5, 4), (8, 4, 4, 4)),
+                    now=2.0,
+                )
+            self.assertEqual(result.kind, "rect")
+            self.assertEqual(result.rects, ((2, 1, 1, 1), (10, 6, 1, 1)))
+            self.assertEqual(terminal.frame, bytes(after))
+        finally:
+            presenter.close()
+
+    def test_empty_damage_marks_an_unchanged_complete_frame(self):
+        pixels = frame(4, 3)
+        presenter = FramePresenter(
+            ConsumerTerm(),
+            stream=True,
+            stream_warmup_seconds=0,
+            stream_keyframe_seconds=0,
+        )
+        try:
+            presenter.present(pixels, 4, 3, 2, 2, now=1.0)
+            with mock.patch.object(
+                presenter_module,
+                "diff_rect",
+                side_effect=AssertionError("full-frame diff was used"),
+            ):
+                result = presenter.present(pixels, 4, 3, 2, 2, damage=(), now=2.0)
+            self.assertEqual(result.kind, "unchanged")
+        finally:
+            presenter.close()
+
     def test_scroll_compose_sends_only_exposed_strip(self):
         term = ConsumerTerm()
         presenter = FramePresenter(term, image_id=3, enable_scroll=True)
@@ -578,6 +672,61 @@ class PresenterTests(unittest.TestCase):
             result = presenter.flush()
             self.assertTrue(result.emitted)
             self.assertEqual(term.payloads[-1], frame(width, height, (2, 2, 2)))
+        finally:
+            presenter.close()
+
+    def test_pacing_accumulates_damage_across_dropped_frames(self):
+        now = [10.0]
+        width, height = 8, 6
+        current = frame(width, height)
+        first = bytearray(current)
+        first[(1 * width + 1) * 3 : (1 * width + 1) * 3 + 3] = b"\xff\0\0"
+        newest = bytearray(first)
+        newest[(4 * width + 6) * 3 : (4 * width + 6) * 3 + 3] = b"\0\xff\0"
+        terminal = ModelTerm()
+        presenter = FramePresenter(
+            terminal,
+            stream=True,
+            max_fps=10,
+            stream_warmup_seconds=0,
+            stream_keyframe_seconds=0,
+            clock=lambda: now[0],
+        )
+        try:
+            presenter.present(current, width, height, 4, 3)
+            now[0] = 10.01
+            presenter.present(
+                bytes(first), width, height, 4, 3, damage=(1, 1, 1, 1)
+            )
+            now[0] = 10.02
+            presenter.present(
+                bytes(newest), width, height, 4, 3, damage=(6, 4, 1, 1)
+            )
+            self.assertEqual(
+                presenter._pending.damage,
+                ((1, 1, 1, 1), (6, 4, 1, 1)),
+            )
+            now[0] = 10.11
+            result = presenter.flush()
+            self.assertEqual(result.rects, ((1, 1, 1, 1), (6, 4, 1, 1)))
+            self.assertEqual(terminal.frame, bytes(newest))
+        finally:
+            presenter.close()
+
+    def test_dropped_unknown_damage_forces_safe_full_frame_diff(self):
+        now = [1.0]
+        presenter = FramePresenter(
+            ConsumerTerm(), stream=True, max_fps=10, clock=lambda: now[0]
+        )
+        try:
+            presenter.present(frame(2, 2), 2, 2, 1, 1)
+            now[0] = 1.01
+            presenter.present(
+                frame(2, 2, (1, 1, 1)), 2, 2, 1, 1, damage=(0, 0, 2, 2)
+            )
+            now[0] = 1.02
+            presenter.present(frame(2, 2, (2, 2, 2)), 2, 2, 1, 1)
+            self.assertIsNone(presenter._pending.damage)
         finally:
             presenter.close()
 
@@ -763,6 +912,9 @@ class PresenterTests(unittest.TestCase):
             lambda: presenter.present(b"\0\0\0", 1, 1, 1, 1, scroll=(1,)),
             lambda: presenter.present(b"\0\0\0", 1, 1, 1, 1, scroll=(0.5, 1)),
             lambda: presenter.present(b"\0\0\0", 1, 1, 1, 1, now=float("nan")),
+            lambda: presenter.present(
+                b"\0\0\0", 1, 1, 1, 1, damage=(0, 0, 2, 1)
+            ),
         )
         try:
             for operation in invalid:

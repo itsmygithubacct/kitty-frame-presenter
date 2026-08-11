@@ -34,6 +34,7 @@ _UINT32_MAX = (1 << 32) - 1
 _INT32_MIN = -(1 << 31)
 _INT32_MAX = (1 << 31) - 1
 _MAX_SHM_SLOTS = 64
+_MAX_DAMAGE_RECTS = 64
 _SHM_RETRY_SECONDS = 0.005
 _UNIX_SOCKET_PATH_BYTES = 107
 _MAX_TAP_RETRY_SECONDS = 3600.0
@@ -280,6 +281,142 @@ def diff_rects(
                 left, right = min(left, bounds[0]), max(right, bounds[1])
         out.append((left, top, right - left, bottom - top))
     return tuple(out)
+
+
+def _damage_hint(value: object, width: int, height: int) -> tuple[Rect, ...] | None:
+    """Validate a producer-supplied damage superset for one complete frame."""
+    if value is None:
+        return None
+    if (
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes, bytearray))
+        and len(value) == 4
+        and all(type(part) is int for part in value)
+    ):
+        values: Iterable[object] = (value,)
+    else:
+        try:
+            values = iter(cast(Iterable[object], value))
+        except TypeError as exc:
+            raise ValueError(
+                "damage must be one rectangle or an iterable of rectangles"
+            ) from exc
+
+    out: list[Rect] = []
+    for index, item in enumerate(values):
+        if index >= _MAX_DAMAGE_RECTS:
+            raise ValueError(
+                f"damage must contain at most {_MAX_DAMAGE_RECTS} rectangles"
+            )
+        rect = _rectangle(item, f"damage rectangle {index + 1}")
+        x, y, rect_width, rect_height = rect
+        if x + rect_width > width or y + rect_height > height:
+            raise ValueError(f"damage rectangle {index + 1} is outside the frame")
+        out.append(rect)
+    return tuple(out)
+
+
+def _rect_union(first: Rect, second: Rect) -> Rect:
+    left = min(first[0], second[0])
+    top = min(first[1], second[1])
+    right = max(first[0] + first[2], second[0] + second[2])
+    bottom = max(first[1] + first[3], second[1] + second[3])
+    return left, top, right - left, bottom - top
+
+
+def _rects_touch(first: Rect, second: Rect) -> bool:
+    return not (
+        first[0] + first[2] < second[0]
+        or second[0] + second[2] < first[0]
+        or first[1] + first[3] < second[1]
+        or second[1] + second[3] < first[1]
+    )
+
+
+def _coalesce_rects(rects: Iterable[Rect], max_rects: int) -> tuple[Rect, ...]:
+    """Merge touching rectangles, then make the least-cost merges to a limit."""
+    limit = _integer(max_rects, "max_rects", minimum=1)
+    merged: list[Rect] = []
+    for rect in rects:
+        candidate = rect
+        index = 0
+        while index < len(merged):
+            if _rects_touch(candidate, merged[index]):
+                candidate = _rect_union(candidate, merged.pop(index))
+                index = 0
+            else:
+                index += 1
+        merged.append(candidate)
+
+    while len(merged) > limit:
+        best: tuple[int, int, int, Rect] | None = None
+        for first_index in range(len(merged) - 1):
+            first = merged[first_index]
+            first_area = first[2] * first[3]
+            for second_index in range(first_index + 1, len(merged)):
+                second = merged[second_index]
+                union = _rect_union(first, second)
+                extra = (
+                    union[2] * union[3]
+                    - first_area
+                    - second[2] * second[3]
+                )
+                choice = (extra, first_index, second_index, union)
+                if best is None or choice[:3] < best[:3]:
+                    best = choice
+        if best is None:
+            break
+        _extra, first_index, second_index, union = best
+        merged[first_index] = union
+        merged.pop(second_index)
+    return tuple(sorted(merged, key=lambda rect: (rect[1], rect[0], rect[3], rect[2])))
+
+
+def diff_damage_rects(
+    prev: object,
+    cur: object,
+    width: int,
+    height: int,
+    damage: object,
+    max_rects: int = 8,
+) -> tuple[Rect, ...]:
+    """Return exact changes while scanning only a trusted damage superset.
+
+    Producers must include every changed pixel in ``damage``.  An empty
+    iterable explicitly means that the complete frame is unchanged; ``None``
+    is rejected here because callers that lack metadata should use
+    :func:`diff_rect` instead.
+    """
+    p, c = _valid_frames(prev, cur, width, height)
+    hints = _damage_hint(damage, width, height)
+    if hints is None:
+        raise ValueError("damage must not be None")
+    max_rects = _integer(max_rects, "max_rects", minimum=1)
+    if prev is cur or not hints:
+        return ()
+    stride = width * FRAME_BYTES
+    changed: list[Rect] = []
+    for x, y, rect_width, rect_height in hints:
+        top: int | None = None
+        bottom = y
+        left, right = x + rect_width, x
+        for row in range(y, y + rect_height):
+            bounds = _row_bounds(
+                p,
+                c,
+                row * stride + x * FRAME_BYTES,
+                rect_width,
+            )
+            if bounds is None:
+                continue
+            if top is None:
+                top = row
+            bottom = row + 1
+            left = min(left, x + bounds[0])
+            right = max(right, x + bounds[1])
+        if top is not None:
+            changed.append((left, top, right - left, bottom - top))
+    return _coalesce_rects(changed, max_rects)
 
 
 def extract_rect(rgb: object, width: int, height: int, rect: Rect) -> bytes:
@@ -1100,6 +1237,7 @@ class _Request:
     content_key: object
     force_full: bool
     scroll: tuple[int, int] | None
+    damage: tuple[Rect, ...] | None
     offered_at: float
 
 
@@ -1190,6 +1328,7 @@ class FramePresenter:
         content_key: object,
         force_full: object,
         scroll: object,
+        damage: object,
         offered_at: object,
     ) -> _Request:
         width, height, columns, rows, origin_row, origin_column = _placement_geometry(
@@ -1201,6 +1340,7 @@ class FramePresenter:
             raise ValueError(f"RGB frame length must be {expected} bytes")
         if scroll is not None:
             scroll = _scroll_hint(scroll)
+        damage = _damage_hint(damage, width, height)
         return _Request(
             data,
             width,
@@ -1212,6 +1352,7 @@ class FramePresenter:
             content_key,
             bool(force_full),
             scroll,
+            damage,
             _time_value(offered_at),
         )
 
@@ -1228,6 +1369,7 @@ class FramePresenter:
         content_key: object = None,
         force_full: bool = False,
         scroll: tuple[int, int] | None = None,
+        damage: Rect | Iterable[Rect] | None = None,
         now: float | None = None,
     ) -> PresentResult:
         if self.closed:
@@ -1244,6 +1386,7 @@ class FramePresenter:
             content_key,
             force_full,
             scroll,
+            damage,
             now,
         )
         now = request.offered_at
@@ -1251,6 +1394,21 @@ class FramePresenter:
         self._offer_to_tap(request)
         if self._pending is not None:
             self.stats.frames_dropped += 1
+            pending = self._pending
+            if (
+                pending.damage is None
+                or request.damage is None
+                or (pending.width, pending.height) != (request.width, request.height)
+            ):
+                request.damage = None
+            else:
+                request.damage = _coalesce_rects(
+                    (*pending.damage, *request.damage), _MAX_DAMAGE_RECTS
+                )
+            # Both hints describe transitions through the dropped frame, not
+            # directly from the last emitted frame to this request.
+            request.scroll = None
+            request.force_full = request.force_full or pending.force_full
             self._pending = None
         if now < self._last_emit_at + self.frame_interval:
             self._pending = request
@@ -1508,11 +1666,31 @@ class FramePresenter:
     def _emit(self, request: _Request, now: float) -> PresentResult:
         if self._full_required(request, now) or self._previous is None:
             return self._emit_full(request, now)
-        normal = diff_rect(self._previous, request.rgb, request.width, request.height)
-        if normal is None:
+        max_rects = 8 if self.stream else 1
+        if self.shm is not None:
+            max_rects = self.shm.capacity
+        rects: tuple[Rect, ...]
+        if request.damage is None:
+            normal = diff_rect(
+                self._previous, request.rgb, request.width, request.height
+            )
+            rects = () if normal is None else (normal,)
+        else:
+            rects = diff_damage_rects(
+                self._previous,
+                request.rgb,
+                request.width,
+                request.height,
+                request.damage,
+                max_rects=max_rects,
+            )
+        if not rects:
             self._previous = request.rgb
             self.stats.frames_unchanged += 1
             return PresentResult("unchanged")
+        normal = rects[0]
+        for rect in rects[1:]:
+            normal = _rect_union(normal, rect)
         if self.enable_scroll:
             candidate = self._scroll_candidate(request, normal)
             if candidate is not None:
@@ -1528,7 +1706,7 @@ class FramePresenter:
                 return self._emit_rects(
                     request, now, residual, compose, "scroll", scrolled=True
                 )
-        return self._emit_rects(request, now, (normal,))
+        return self._emit_rects(request, now, rects)
 
     def close(self, *, discard: bool = False) -> None:
         if self.closed:

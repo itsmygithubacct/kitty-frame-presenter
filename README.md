@@ -38,6 +38,10 @@ from kitty_frame_presenter import FramePresenter
 presenter = FramePresenter(term, image_id=7, max_fps=30)
 presenter.present(rgb, width, height, columns, rows)
 
+# Capture backends can avoid a full-frame comparison by supplying a trusted
+# superset of changed pixels. One rectangle and multiple rectangles work.
+presenter.present(rgb, width, height, columns, rows, damage=((8, 12, 40, 20),))
+
 # Call from the event loop; this sends the newest queued frame when pacing or
 # shared-memory backpressure permits it.
 presenter.flush()
@@ -58,6 +62,15 @@ IDs, and scroll offsets must be exact integers in their protocol ranges; frame
 times must be finite, non-negative values. Malformed input fails before state or
 statistics advance. Calling `present()` after `close()` raises `RuntimeError`.
 Both `FramePresenter` and `PosixShmRing` can be used as context managers.
+
+`damage=(x, y, width, height)` or an iterable of such rectangles tells the
+presenter where it needs to compare the new complete frame with the displayed
+one. Every changed pixel must be covered. Passing `damage=()` explicitly marks
+the complete frame unchanged; leaving `damage=None` uses the safe full-frame
+comparison. The presenter shrinks hints to actual pixel changes, preserves
+separate regions when transport capacity permits, and accumulates hints when
+frame pacing replaces queued work. If any transition lacks trustworthy damage
+metadata, that accumulated transition falls back to a full-frame comparison.
 
 When work is queued, `next_deadline` is the earliest useful monotonic time for
 `flush()`. It accounts for both frame pacing and a short future retry after
