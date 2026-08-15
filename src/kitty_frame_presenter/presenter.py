@@ -92,7 +92,19 @@ def diff_rect(prev, cur, width: int, height: int) -> Optional[Rect]:
         bottom -= 1
     left, right = width, 0
     for y in range(top, bottom):
-        bounds = _row_bounds(p, c, y * stride, width)
+        offset = y * stride
+        if right > left:
+            # A row can only widen the established span by differing in the
+            # margins outside it, so compare just those two slices before
+            # paying for a full column scan.
+            lb = left * FRAME_BYTES
+            rb = right * FRAME_BYTES
+            if ((left <= 0 or p[offset:offset + lb] == c[offset:offset + lb])
+                    and (right >= width
+                         or p[offset + rb:offset + stride]
+                         == c[offset + rb:offset + stride])):
+                continue
+        bounds = _row_bounds(p, c, offset, width)
         if bounds is None:
             continue
         left = min(left, bounds[0])
@@ -146,9 +158,23 @@ def diff_rects(prev, cur, width: int, height: int, max_rects: int = 2) -> Tuple[
     for top, bottom in bands:
         left, right = width, 0
         for y in range(top, bottom):
-            bounds = _row_bounds(p, c, y * stride, width)
+            offset = y * stride
+            if right > left:
+                # Same margin shortcut as diff_rect: only the slices outside
+                # the established span can change this band's rectangle.
+                lb = left * FRAME_BYTES
+                rb = right * FRAME_BYTES
+                if ((left <= 0
+                     or p[offset:offset + lb] == c[offset:offset + lb])
+                        and (right >= width
+                             or p[offset + rb:offset + stride]
+                             == c[offset + rb:offset + stride])):
+                    continue
+            bounds = _row_bounds(p, c, offset, width)
             if bounds:
                 left, right = min(left, bounds[0]), max(right, bounds[1])
+                if left == 0 and right == width:
+                    break
         out.append((left, top, right - left, bottom - top))
     return tuple(out)
 
