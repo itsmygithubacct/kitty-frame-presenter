@@ -263,14 +263,19 @@ def _shift_prediction(prev: bytes, width: int, height: int,
     result = bytearray(prev)
     stride = width * FRAME_BYTES
     row_bytes = copy_w * FRAME_BYTES
-    # Snapshot the overlap before assigning because source/destination overlap.
-    moved = bytearray(row_bytes * copy_h)
-    for row in range(copy_h):
-        at = (src_y + row) * stride + src_x * FRAME_BYTES
-        moved[row * row_bytes:(row + 1) * row_bytes] = prev[at:at + row_bytes]
-    for row in range(copy_h):
-        at = (dst_y + row) * stride + dst_x * FRAME_BYTES
-        result[at:at + row_bytes] = moved[row * row_bytes:(row + 1) * row_bytes]
+    # Reads come from the immutable previous frame and writes go to a
+    # separate buffer, so the simulation has no aliasing to defend against;
+    # the terminal-side overlap hazard is what the compose command's N=2
+    # fork bit addresses.
+    if dx == 0:
+        # A pure vertical shift moves one contiguous byte range.
+        result[dst_y * stride:(dst_y + copy_h) * stride] = \
+            prev[src_y * stride:(src_y + copy_h) * stride]
+    else:
+        for row in range(copy_h):
+            src = (src_y + row) * stride + src_x * FRAME_BYTES
+            dst = (dst_y + row) * stride + dst_x * FRAME_BYTES
+            result[dst:dst + row_bytes] = prev[src:src + row_bytes]
     return bytes(result), source, dest
 
 
