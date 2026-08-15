@@ -782,6 +782,50 @@ class PresenterTests(unittest.TestCase):
         finally:
             presenter.close(discard=True)
 
+    def test_write_failure_releases_shared_memory_slots(self):
+        class IntermittentTerm:
+            """Terminal whose write raises a few times, then recovers."""
+
+            def __init__(self, failures):
+                self.failures = failures
+                self.inner = ConsumerTerm()
+
+            def write(self, value):
+                if self.failures:
+                    self.failures -= 1
+                    raise BlockingIOError("output would block")
+                self.inner.write(value)
+
+        term = IntermittentTerm(failures=3)
+        presenter = FramePresenter(term, shm_slots=3)
+        try:
+            width, height = 4, 3
+            rgb = frame(width, height)
+            # A transient write failure must not strand ring capacity: the
+            # terminal never saw the object names, so nothing can consume
+            # them and only a local rollback can free the slots.
+            for _ in range(3):
+                with self.assertRaises(BlockingIOError):
+                    presenter.present(rgb, width, height, 2, 2)
+                self.assertEqual(presenter.shm.in_flight, 0)
+            for slot in presenter.shm._slots:
+                self.assertFalse(
+                    os.path.exists("/dev/shm/" + slot.name.lstrip("/")))
+            result = presenter.present(rgb, width, height, 2, 2)
+            self.assertEqual(result.kind, "full")
+            self.assertTrue(result.emitted)
+            # The rectangle path shares the same rollback contract.
+            changed = bytearray(rgb)
+            changed[0:3] = b"\x09\x08\x07"
+            term.failures = 1
+            with self.assertRaises(BlockingIOError):
+                presenter.present(bytes(changed), width, height, 2, 2)
+            self.assertEqual(presenter.shm.in_flight, 0)
+            result = presenter.present(bytes(changed), width, height, 2, 2)
+            self.assertEqual(result.kind, "rect")
+        finally:
+            presenter.close(discard=True)
+
     def test_latency_history_is_bounded_but_aggregates_are_complete(self):
         now = [10.0]
         term = ConsumerTerm()

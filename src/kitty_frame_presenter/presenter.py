@@ -887,6 +887,21 @@ class PosixShmRing:
                     pass
             raise
 
+    def revoke(self, names: Iterable[str]) -> None:
+        """Roll back slots whose command never reached the terminal.
+
+        The caller guarantees the escape sequence naming these objects was
+        not delivered, so no consumer can be waiting on them: unlink the
+        objects and free the slots so the ring recovers its capacity.
+        """
+        if self.closed:
+            return
+        wanted = set(names)
+        for slot in self._slots:
+            if slot.busy and slot.name in wanted:
+                self._unlink(slot.name)
+                self._release(slot)
+
     def close(self, *, discard: bool = False) -> None:
         """Release local handles without invalidating unread payloads.
 
@@ -1539,6 +1554,7 @@ class FramePresenter:
         return PresentResult(kind, True, rect_tuple, pixel_bytes, wire_bytes)
 
     def _emit_full(self, request: _Request, now: float) -> PresentResult:
+        names: tuple[str, ...] = ()
         if self.stream:
             sequence = build_direct(
                 request.rgb,
@@ -1556,11 +1572,11 @@ class FramePresenter:
             if shm is None:
                 raise RuntimeError("local presenter has no shared-memory transport")
             try:
-                name = shm.put_many((request.rgb,))[0]
+                names = shm.put_many((request.rgb,))
             except ShmBusy:
                 return PresentResult("busy")
             sequence = build_full_shm(
-                name,
+                names[0],
                 request.width,
                 request.height,
                 request.columns,
@@ -1569,7 +1585,15 @@ class FramePresenter:
                 request.origin_row,
                 request.origin_column,
             )
-        wire = self._write(_SYNC_BEGIN + sequence + _SYNC_END)
+        try:
+            wire = self._write(_SYNC_BEGIN + sequence + _SYNC_END)
+        except Exception:
+            # The terminal never received the command naming these objects,
+            # so nobody can consume and unlink them.  Roll the slots back or
+            # each failed write would strand ring capacity forever.
+            if names and self.shm is not None:
+                self.shm.revoke(names)
+            raise
         return self._finish(request, now, "full", (), len(request.rgb), wire, full=True)
 
     def _emit_rects(
@@ -1585,6 +1609,7 @@ class FramePresenter:
             extract_rect(request.rgb, request.width, request.height, rect)
             for rect in rects
         )
+        names: tuple[str, ...] = ()
         if self.stream:
             edits = "".join(
                 build_frame_edit(
@@ -1612,7 +1637,15 @@ class FramePresenter:
                 )
                 for name, rect in zip(names, rects)
             )
-        wire = self._write(_SYNC_BEGIN + prefix + edits + _SYNC_END)
+        try:
+            wire = self._write(_SYNC_BEGIN + prefix + edits + _SYNC_END)
+        except Exception:
+            # Same rollback contract as the full-frame path: an undelivered
+            # command must not leave slots waiting on a consumer that will
+            # never see their names.
+            if names and self.shm is not None:
+                self.shm.revoke(names)
+            raise
         return self._finish(
             request, now, kind, rects, sum(map(len, payloads)), wire, scroll=scrolled
         )
