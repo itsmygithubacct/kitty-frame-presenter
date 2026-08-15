@@ -317,10 +317,6 @@ class PresenterTests(unittest.TestCase):
             presenter.close()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class FrameTapTests(unittest.TestCase):
     """A second consumer of the frames, for a remote encoder.
 
@@ -388,3 +384,7 @@ class FrameTapTests(unittest.TestCase):
         # And it is not called again.
         presenter.present(rgb, 4, 3, 2, 1)
         self.assertEqual(len(calls), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
