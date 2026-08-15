@@ -38,6 +38,10 @@ from kitty_frame_presenter import (
     extract_rect,
     wrap_tmux_passthrough,
 )
+from kitty_frame_presenter.presenter import (  # noqa: E402
+    _coalesce_rects,
+    _shift_prediction,
+)
 
 
 class ConsumerTerm:
@@ -525,6 +529,290 @@ class BuilderTests(unittest.TestCase):
         for operation in invalid:
             with self.subTest(operation=operation), self.assertRaises(ValueError):
                 operation()
+
+
+def reference_rect(prev, cur, width, height):
+    """Per-pixel oracle for diff_rect's exact bounding rectangle."""
+    columns, rows = [], []
+    for y in range(height):
+        for x in range(width):
+            at = (y * width + x) * 3
+            if prev[at:at + 3] != cur[at:at + 3]:
+                columns.append(x)
+                rows.append(y)
+    if not columns:
+        return None
+    left, right = min(columns), max(columns) + 1
+    top, bottom = min(rows), max(rows) + 1
+    return left, top, right - left, bottom - top
+
+
+def reference_rects(prev, cur, width, height, max_rects=2):
+    """Per-pixel oracle for diff_rects, sharing only the band-merge policy."""
+    stride = width * 3
+    bands = []
+    start = None
+    for y in range(height):
+        changed = prev[y * stride:(y + 1) * stride] != cur[y * stride:(y + 1) * stride]
+        if changed and start is None:
+            start = y
+        elif not changed and start is not None:
+            bands.append((start, y))
+            start = None
+    if start is not None:
+        bands.append((start, height))
+    if not bands:
+        return ()
+    while len(bands) > max_rects:
+        at = min(range(len(bands) - 1), key=lambda i: bands[i + 1][0] - bands[i][1])
+        bands[at:at + 2] = [(bands[at][0], bands[at + 1][1])]
+    out = []
+    for top, bottom in bands:
+        columns = [x for y in range(top, bottom) for x in range(width)
+                   if prev[(y * width + x) * 3:(y * width + x) * 3 + 3]
+                   != cur[(y * width + x) * 3:(y * width + x) * 3 + 3]]
+        left, right = min(columns), max(columns) + 1
+        out.append((left, top, right - left, bottom - top))
+    return tuple(out)
+
+
+def reference_shift(prev, width, height, dx, dy):
+    """Pixel-grid oracle for _shift_prediction's simulated compose."""
+    copy_w, copy_h = width - abs(dx), height - abs(dy)
+    src_x, src_y = max(0, -dx), max(0, -dy)
+    dst_x, dst_y = max(0, dx), max(0, dy)
+    pixels = [[prev[(y * width + x) * 3:(y * width + x) * 3 + 3]
+               for x in range(width)] for y in range(height)]
+    result = [row[:] for row in pixels]
+    for row in range(copy_h):
+        for col in range(copy_w):
+            result[dst_y + row][dst_x + col] = pixels[src_y + row][src_x + col]
+    flat = b"".join(b"".join(row) for row in result)
+    return (flat, (src_x, src_y, copy_w, copy_h), (dst_x, dst_y, copy_w, copy_h))
+
+
+def damaged_copy(rng, base, width, height):
+    """Return base with a randomized damage pattern applied."""
+    out = bytearray(base)
+
+    def poke(x, y):
+        at = (y * width + x) * 3
+        out[at:at + 3] = bytes(rng.randrange(256) for _ in range(3))
+
+    pattern = rng.randrange(5)
+    if pattern == 0:
+        for _ in range(rng.randrange(1, 9)):
+            poke(rng.randrange(width), rng.randrange(height))
+    elif pattern == 1:
+        x = rng.randrange(width)
+        for y in range(height):
+            poke(x, y)
+    elif pattern == 2:
+        y = rng.randrange(height)
+        for x in range(width):
+            poke(x, y)
+    elif pattern == 3:
+        x0, y0 = rng.randrange(width), rng.randrange(height)
+        for y in range(y0, min(height, y0 + rng.randrange(1, 8))):
+            for x in range(x0, min(width, x0 + rng.randrange(1, 12))):
+                poke(x, y)
+    else:
+        for y in range(height):
+            if rng.random() < 0.4:
+                for x in range(rng.randrange(width),
+                               rng.randrange(1, width + 1)):
+                    poke(x, y)
+    return bytes(out)
+
+
+def reference_damage_rects(prev, cur, width, height, damage, max_rects=8):
+    """Per-pixel oracle for diff_damage_rects, sharing only the coalesce policy."""
+    changed = []
+    for x, y, rect_width, rect_height in damage:
+        columns, rows = [], []
+        for yy in range(y, y + rect_height):
+            for xx in range(x, x + rect_width):
+                at = (yy * width + xx) * 3
+                if prev[at:at + 3] != cur[at:at + 3]:
+                    columns.append(xx)
+                    rows.append(yy)
+        if columns:
+            left, right = min(columns), max(columns) + 1
+            top, bottom = min(rows), max(rows) + 1
+            changed.append((left, top, right - left, bottom - top))
+    return _coalesce_rects(changed, max_rects)
+
+
+def partitioned_damage(rng, width, height):
+    """Split the frame into a random grid; any partition is a valid superset."""
+
+    def cuts(limit):
+        count = rng.randrange(0, min(4, limit - 1) + 1)
+        values = sorted(rng.sample(range(1, limit), count)) if count else []
+        return [0] + values + [limit]
+
+    xs, ys = cuts(width), cuts(height)
+    return tuple(
+        (x0, y0, x1 - x0, y1 - y0)
+        for y0, y1 in zip(ys, ys[1:])
+        for x0, x1 in zip(xs, xs[1:])
+    )
+
+
+class ReferenceDiffTests(unittest.TestCase):
+    """Anchor the damage arithmetic to independent per-pixel oracles.
+
+    The diff functions promise exact rectangles; these tests pin that
+    promise on shapes chosen to stress the column-bound scans (thin
+    full-height columns, ragged text, margins around an established span)
+    and on randomized frames, so any rewrite of the scanning internals
+    must reproduce the output byte for byte.
+    """
+
+    def _anchor_frames(self):
+        width, height = 120, 90
+        rng = random.Random(1207)
+        base = bytes(rng.randrange(256) for _ in range(width * height * 3))
+        shapes = []
+        # A caret-thin full-height column.
+        column = bytearray(base)
+        for y in range(height):
+            at = (y * width + 61) * 3
+            column[at:at + 6] = b"\xff\xff\xff\xff\xff\xff"
+        shapes.append(bytes(column))
+        # A centered block.
+        block = bytearray(base)
+        for y in range(25, 65):
+            for x in range(30, 90):
+                at = (y * width + x) * 3
+                block[at:at + 3] = b"\x01\x02\x03"
+        shapes.append(bytes(block))
+        # Ragged line-editor damage: rows of differing widths.
+        ragged = bytearray(base)
+        for y in range(20, 70):
+            span = 10 + (y * 7) % 60
+            for x in range(8, 8 + span):
+                at = (y * width + x) * 3
+                ragged[at:at + 3] = b"\x30\x40\x50"
+        shapes.append(bytes(ragged))
+        # Damage touching every frame edge.
+        edges = bytearray(base)
+        for x, y in ((0, 0), (width - 1, 0), (0, height - 1),
+                     (width - 1, height - 1)):
+            at = (y * width + x) * 3
+            edges[at:at + 3] = b"\x99\x99\x99"
+        shapes.append(bytes(edges))
+        # A full-frame change.
+        shapes.append(bytes((value + 1) % 256 for value in base))
+        return width, height, base, shapes
+
+    def test_diff_rect_matches_oracle_on_anchor_shapes(self):
+        width, height, base, shapes = self._anchor_frames()
+        self.assertIsNone(diff_rect(base, bytes(base), width, height))
+        for shape in shapes:
+            self.assertEqual(diff_rect(base, shape, width, height),
+                             reference_rect(base, shape, width, height))
+
+    def test_diff_rects_matches_oracle_on_anchor_shapes(self):
+        width, height, base, shapes = self._anchor_frames()
+        self.assertEqual(diff_rects(base, bytes(base), width, height), ())
+        for shape in shapes:
+            for max_rects in (1, 2, 3):
+                self.assertEqual(
+                    diff_rects(base, shape, width, height, max_rects),
+                    reference_rects(base, shape, width, height, max_rects))
+
+    def test_diff_functions_match_oracle_on_randomized_frames(self):
+        rng = random.Random(41)
+        for _ in range(120):
+            width = rng.randrange(1, 70)
+            height = rng.randrange(1, 40)
+            base = bytes(rng.randrange(256)
+                         for _ in range(width * height * 3))
+            cur = damaged_copy(rng, base, width, height)
+            self.assertEqual(diff_rect(base, cur, width, height),
+                             reference_rect(base, cur, width, height))
+            max_rects = rng.randrange(1, 4)
+            self.assertEqual(
+                diff_rects(base, cur, width, height, max_rects),
+                reference_rects(base, cur, width, height, max_rects))
+
+    def test_diff_damage_rects_matches_oracle_on_randomized_frames(self):
+        rng = random.Random(67)
+        for _ in range(120):
+            width = rng.randrange(1, 70)
+            height = rng.randrange(1, 40)
+            base = bytes(rng.randrange(256)
+                         for _ in range(width * height * 3))
+            cur = damaged_copy(rng, base, width, height)
+            hints = partitioned_damage(rng, width, height)
+            max_rects = rng.randrange(1, 5)
+            self.assertEqual(
+                diff_damage_rects(base, cur, width, height, hints, max_rects),
+                reference_damage_rects(
+                    base, cur, width, height, hints, max_rects))
+            self.assertEqual(
+                diff_damage_rects(base, cur, width, height, ()), ())
+
+
+class ReferenceShiftTests(unittest.TestCase):
+    def test_shift_prediction_matches_oracle(self):
+        rng = random.Random(53)
+        for _ in range(120):
+            width = rng.randrange(2, 26)
+            height = rng.randrange(2, 22)
+            prev = bytes(rng.randrange(256)
+                         for _ in range(width * height * 3))
+            if rng.random() < 0.6:
+                dx = 0
+                dy = rng.choice([-1, 1]) * rng.randrange(1, height)
+            else:
+                dx = rng.randrange(-(width - 1), width)
+                dy = rng.randrange(-(height - 1), height)
+                if not dx and not dy:
+                    dx = 1
+            self.assertEqual(
+                _shift_prediction(prev, width, height, dx, dy),
+                reference_shift(prev, width, height, dx, dy))
+
+
+class WireAccountingTests(unittest.TestCase):
+    def test_builders_emit_ascii_where_length_equals_encoded_size(self):
+        rng = random.Random(99)
+        rgb = bytes(rng.randrange(256) for _ in range(24 * 16 * 3))
+        name = "/kitty-frame-presenter-407-c0ffee-0"
+        pieces = (
+            build_direct(rgb, 24, 16, 8, 4, 5),
+            build_direct(rgb, 24, 16, 8, 4, 5, in_tmux=True),
+            build_frame_edit(rgb, 24, 16, 3, 2, 5),
+            build_frame_edit(rgb, 24, 16, 3, 2, 5, in_tmux=True),
+            build_full_shm(name, 24, 16, 8, 4, 5),
+            build_frame_edit_shm(name, 24, 16, 3, 2, 5),
+            build_compose(5, (0, 0, 4, 4), (1, 2, 4, 4)),
+            build_compose(5, (0, 0, 4, 4), (1, 2, 4, 4), in_tmux=True),
+            wrap_tmux_passthrough("\x1b_Ga=d,d=A\x1b\\"),
+        )
+        for piece in pieces:
+            self.assertTrue(piece.isascii())
+            self.assertEqual(len(piece), len(piece.encode("utf-8")))
+
+    def test_wire_bytes_equals_encoded_terminal_output(self):
+        rng = random.Random(4)
+        width, height = 20, 12
+        first = bytes(rng.randrange(256) for _ in range(width * height * 3))
+        changed = bytearray(first)
+        changed[300:303] = bytes((first[300] + 1) % 256 for _ in range(3))
+        for stream in (False, True):
+            term = ConsumerTerm()
+            presenter = FramePresenter(term, image_id=2, stream=stream)
+            try:
+                presenter.present(first, width, height, 5, 3)
+                presenter.present(bytes(changed), width, height, 5, 3)
+                self.assertEqual(
+                    presenter.stats.wire_bytes,
+                    sum(len(write.encode("utf-8")) for write in term.writes))
+            finally:
+                presenter.close(discard=True)
 
 
 class PresenterTests(unittest.TestCase):
