@@ -727,7 +727,11 @@ class FramePresenter:
     def _write(self, sequence: str) -> int:
         if sequence:
             self.terminal.write(sequence)
-        return len(sequence.encode("utf-8"))
+        # Every builder emits pure ASCII (CSI/APC framing, control keys,
+        # base64 payloads), so the character count is the wire byte count;
+        # re-encoding a multi-megabyte inline frame just to count it would
+        # duplicate the whole sequence.  Pinned by the wire accounting tests.
+        return len(sequence)
 
     def _finish(self, request: _Request, now: float, kind: str,
                 rects: Iterable[Rect], pixel_bytes: int, wire_bytes: int,
