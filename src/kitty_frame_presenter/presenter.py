@@ -201,7 +201,19 @@ def diff_rect(prev: object, cur: object, width: int, height: int) -> Rect | None
         bottom -= 1
     left, right = width, 0
     for y in range(top, bottom):
-        bounds = _row_bounds(p, c, y * stride, width)
+        offset = y * stride
+        if right > left:
+            # A row can only widen the established span by differing in the
+            # margins outside it, so compare just those two slices before
+            # paying for a full column scan.
+            lb = left * FRAME_BYTES
+            rb = right * FRAME_BYTES
+            if (left <= 0 or p[offset : offset + lb] == c[offset : offset + lb]) and (
+                right >= width
+                or p[offset + rb : offset + stride] == c[offset + rb : offset + stride]
+            ):
+                continue
+        bounds = _row_bounds(p, c, offset, width)
         if bounds is None:
             continue
         left = min(left, bounds[0])
@@ -276,9 +288,25 @@ def diff_rects(
     for top, bottom in bands:
         left, right = width, 0
         for y in range(top, bottom):
-            bounds = _row_bounds(p, c, y * stride, width)
+            offset = y * stride
+            if right > left:
+                # Same margin shortcut as diff_rect: only the slices outside
+                # the established span can change this band's rectangle.
+                lb = left * FRAME_BYTES
+                rb = right * FRAME_BYTES
+                if (
+                    left <= 0 or p[offset : offset + lb] == c[offset : offset + lb]
+                ) and (
+                    right >= width
+                    or p[offset + rb : offset + stride]
+                    == c[offset + rb : offset + stride]
+                ):
+                    continue
+            bounds = _row_bounds(p, c, offset, width)
             if bounds:
                 left, right = min(left, bounds[0]), max(right, bounds[1])
+                if left == 0 and right == width:
+                    break
         out.append((left, top, right - left, bottom - top))
     return tuple(out)
 
@@ -400,13 +428,28 @@ def diff_damage_rects(
         top: int | None = None
         bottom = y
         left, right = x + rect_width, x
+        row_bytes = rect_width * FRAME_BYTES
         for row in range(y, y + rect_height):
-            bounds = _row_bounds(
-                p,
-                c,
-                row * stride + x * FRAME_BYTES,
-                rect_width,
-            )
+            offset = row * stride + x * FRAME_BYTES
+            if right > left:
+                # Margin shortcut, adapted for this loop's row-band tracking:
+                # clean margins mean the span cannot widen, but the interior
+                # must still be compared so top and bottom stay exact.
+                lb = (left - x) * FRAME_BYTES
+                rb = (right - x) * FRAME_BYTES
+                if (
+                    left <= x or p[offset : offset + lb] == c[offset : offset + lb]
+                ) and (
+                    right >= x + rect_width
+                    or p[offset + rb : offset + row_bytes]
+                    == c[offset + rb : offset + row_bytes]
+                ):
+                    if p[offset + lb : offset + rb] != c[offset + lb : offset + rb]:
+                        if top is None:
+                            top = row
+                        bottom = row + 1
+                    continue
+            bounds = _row_bounds(p, c, offset, rect_width)
             if bounds is None:
                 continue
             if top is None:
