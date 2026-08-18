@@ -162,8 +162,11 @@ depend on the host, while the emitted checksum makes workload drift visible.
 
 The package intentionally contains no terminal lifecycle, keyboard/mouse
 decoder, framebuffer renderer, X11 capture code, or application policy. Those
-belong in `kitty-terminal-session`, `kitty-keyboard`, the application, or its
-capture backend.
+belong in `kitty-terminal-session`,
+[`kitty-input`](https://github.com/itsmygithubacct/kitty-input), the
+application, or its capture backend. The low-level keyboard decoder is bundled
+under `kitty-input/third_party/kitty_keyboard`; it is not a standalone stack
+repository.
 
 The API is pre-1.0 and may change between minor releases.
 
