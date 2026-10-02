@@ -47,6 +47,11 @@ Rect = tuple[int, int, int, int]
 
 
 class TerminalWriter(Protocol):
+    """Ordered writer: return only after accepting all text, or raise.
+
+    After raising, discard any unaccepted suffix before accepting another write.
+    """
+
     def write(self, value: str) -> object: ...
 
 
@@ -779,15 +784,16 @@ class _ShmSlot:
     fd: int = -1
     mapping: mmap.mmap | None = None
     busy: bool = False
+    generation: int = 0
 
 
 class PosixShmRing:
     """A bounded, unlink-acknowledged POSIX shared-memory transport.
 
     Kitty unlinks a ``t=s`` object immediately after opening it.  An absent
-    name is therefore a consumption acknowledgement.  Reusing that *name*
-    creates a new object; Kitty's mapping of the old unlinked object remains
-    valid, so a fast producer cannot tear an older frame.
+    name is therefore a consumption acknowledgement. Each released slot gets
+    a fresh generation name, so a delayed command cannot open a later payload.
+    Kitty's mapping of the old unlinked object remains valid.
     """
 
     def __init__(self, slots: int = 3, prefix: str = "kitty-frame-presenter"):
@@ -809,7 +815,7 @@ class PosixShmRing:
         ).strip("-")
         base = (base or "kitty-frame-presenter")[:192]
         self._slots = [
-            _ShmSlot(f"/{base}-{os.getpid()}-{token}-{i}") for i in range(slots)
+            _ShmSlot(f"/{base}-{os.getpid()}-{token}-{i}-0") for i in range(slots)
         ]
         self.closed = False
 
@@ -830,6 +836,8 @@ class PosixShmRing:
     def _release(slot: _ShmSlot) -> None:
         mapping, descriptor = slot.mapping, slot.fd
         slot.mapping, slot.fd, slot.busy = None, -1, False
+        slot.generation += 1
+        slot.name = slot.name.rsplit("-", 1)[0] + f"-{slot.generation}"
         error: Exception | None = None
         if mapping is not None:
             try:
@@ -1348,6 +1356,8 @@ class FramePresenter:
         self._busy_retry_at = float("-inf")
         self._base_signature: tuple[int, int, int, int, int, int, object] | None = None
         self._previous: bytes | None = None
+        self._needs_resync = False
+        self._shm_write_failed = False
         self._pending: _Request | None = None
         self.tap = tap
         self.tap_failures = 0
@@ -1552,6 +1562,15 @@ class FramePresenter:
 
     def _write(self, sequence: str) -> int:
         if sequence:
+            if self._needs_resync:
+                # End a partial APC/DCS before sending a delete command. Kitty
+                # cancels its pending graphics load on delete, including when
+                # the interrupted transfer was an animation-frame edit.
+                sequence = (
+                    "\x1b\\" + _apc(
+                        f"a=d,d=I,i={self.image_id},q=2", in_tmux=self.in_tmux
+                    ) + _SYNC_END + sequence
+                )
             try:
                 self.terminal.write(sequence)
             except Exception:
@@ -1560,7 +1579,14 @@ class FramePresenter:
                 # next successful write must rebuild the complete placement.
                 self._previous = None
                 self._base_signature = None
+                self._needs_resync = True
+                if self.shm is not None:
+                    # Names may already be queued at the reader. Keep their
+                    # payloads; inline fallback avoids exhausting the bounded
+                    # ring when some names never reached the reader at all.
+                    self._shm_write_failed = True
                 raise
+            self._needs_resync = False
         # Every sequence assembled here is ASCII.  Encoding it solely to count
         # wire bytes doubled peak storage for large inline frames.
         return len(sequence)
@@ -1606,7 +1632,7 @@ class FramePresenter:
 
     def _emit_full(self, request: _Request, now: float) -> PresentResult:
         names: tuple[str, ...] = ()
-        if self.stream:
+        if self.stream or self._shm_write_failed:
             sequence = build_direct(
                 request.rgb,
                 request.width,
@@ -1636,15 +1662,7 @@ class FramePresenter:
                 request.origin_row,
                 request.origin_column,
             )
-        try:
-            wire = self._write(_SYNC_BEGIN + sequence + _SYNC_END)
-        except Exception:
-            # The terminal never received the command naming these objects,
-            # so nobody can consume and unlink them.  Roll the slots back or
-            # each failed write would strand ring capacity forever.
-            if names and self.shm is not None:
-                self.shm.revoke(names)
-            raise
+        wire = self._write(_SYNC_BEGIN + sequence + _SYNC_END)
         return self._finish(request, now, "full", (), len(request.rgb), wire, full=True)
 
     def _emit_rects(
@@ -1661,7 +1679,7 @@ class FramePresenter:
             for rect in rects
         )
         names: tuple[str, ...] = ()
-        if self.stream:
+        if self.stream or self._shm_write_failed:
             edits = "".join(
                 build_frame_edit(
                     payload,
@@ -1688,15 +1706,7 @@ class FramePresenter:
                 )
                 for name, rect in zip(names, rects)
             )
-        try:
-            wire = self._write(_SYNC_BEGIN + prefix + edits + _SYNC_END)
-        except Exception:
-            # Same rollback contract as the full-frame path: an undelivered
-            # command must not leave slots waiting on a consumer that will
-            # never see their names.
-            if names and self.shm is not None:
-                self.shm.revoke(names)
-            raise
+        wire = self._write(_SYNC_BEGIN + prefix + edits + _SYNC_END)
         return self._finish(
             request, now, kind, rects, sum(map(len, payloads)), wire, scroll=scrolled
         )

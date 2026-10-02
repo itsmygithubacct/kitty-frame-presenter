@@ -53,6 +53,15 @@ in-flight shared-memory names available until Kitty consumes and unlinks them.
 If buffered output is being abandoned and will never reach a terminal, call
 `close(discard=True)` to unlink those payloads explicitly.
 
+A writer must accept the entire string before returning and preserve output order.
+If it raises after partial delivery, it must discard any unaccepted suffix before
+accepting the next write. The presenter cancels pending graphics data before its
+next full placement. After a shared-memory write failure it retains outstanding
+payloads and uses inline output for the rest of its lifetime, keeping resource
+use bounded without risking delayed readers. Unconsumed names remain available
+on normal close; use `discard=True` only when no reader can still need them.
+Released ring slots receive fresh generation names.
+
 For a remote or tmux-forwarded stream, construct with `stream=True` and, when
 appropriate, `in_tmux=True`.
 

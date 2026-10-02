@@ -88,6 +88,11 @@ class ModelTerm:
     def write(self, value):
         for match in self.APC.finditer(value):
             control = self._controls(match.group(1))
+            if control.get("a") == "d":
+                self._metadata = None
+                self._payload = []
+                self.frame = None
+                continue
             if control.get("a") == "c":
                 self._compose(control)
                 continue
@@ -305,7 +310,7 @@ class DamageTests(unittest.TestCase):
 
 
 class SharedMemoryTests(unittest.TestCase):
-    def test_ring_saturates_then_reuses_unlinked_name_safely(self):
+    def test_ring_saturates_then_uses_fresh_generation(self):
         ring = PosixShmRing(2, prefix="kitty-frame-presenter-test")
         try:
             names = ring.put_many((b"first", b"second"))
@@ -314,9 +319,23 @@ class SharedMemoryTests(unittest.TestCase):
                 ring.put_many((b"third",))
             os.unlink("/dev/shm/" + names[0].lstrip("/"))
             replacement = ring.put_many((b"third",))[0]
-            self.assertEqual(replacement, names[0])
+            self.assertNotEqual(replacement, names[0])
             with open("/dev/shm/" + replacement.lstrip("/"), "rb") as stream:
                 self.assertEqual(stream.read(), b"third")
+        finally:
+            ring.close(discard=True)
+
+    def test_revoked_name_cannot_identify_replacement(self):
+        ring = PosixShmRing(1, prefix="kitty-frame-presenter-generation-test")
+        try:
+            old = ring.put_many((b"old",))[0]
+            ring.revoke((old,))
+            new = ring.put_many((b"new",))[0]
+            self.assertNotEqual(old, new)
+            ring.revoke((old,))
+            self.assertEqual(ring.in_flight, 1)
+            with open("/dev/shm/" + new.lstrip("/"), "rb") as stream:
+                self.assertEqual(stream.read(), b"new")
         finally:
             ring.close(discard=True)
 
@@ -1070,13 +1089,13 @@ class PresenterTests(unittest.TestCase):
         finally:
             presenter.close(discard=True)
 
-    def test_write_failure_releases_shared_memory_slots(self):
+    def test_write_failure_preserves_shared_memory_and_falls_back_inline(self):
         class IntermittentTerm:
             """Terminal whose write raises a few times, then recovers."""
 
             def __init__(self, failures):
                 self.failures = failures
-                self.inner = ConsumerTerm()
+                self.inner = ModelTerm()
 
             def write(self, value):
                 if self.failures:
@@ -1089,30 +1108,110 @@ class PresenterTests(unittest.TestCase):
         try:
             width, height = 4, 3
             rgb = frame(width, height)
-            # A transient write failure must not strand ring capacity: the
-            # terminal never saw the object names, so nothing can consume
-            # them and only a local rollback can free the slots.
+            # Delivery is unknown to the presenter. Retain the first payload
+            # and use inline output thereafter to keep resource use bounded.
             for _ in range(3):
                 with self.assertRaises(BlockingIOError):
                     presenter.present(rgb, width, height, 2, 2)
-                self.assertEqual(presenter.shm.in_flight, 0)
-            for slot in presenter.shm._slots:
-                self.assertFalse(
-                    os.path.exists("/dev/shm/" + slot.name.lstrip("/")))
+                self.assertEqual(presenter.shm.in_flight, 1)
             result = presenter.present(rgb, width, height, 2, 2)
             self.assertEqual(result.kind, "full")
             self.assertTrue(result.emitted)
-            # The rectangle path shares the same rollback contract.
+            self.assertEqual(term.inner.frame, rgb)
+            # Further failures still recover without allocating more slots.
             changed = bytearray(rgb)
             changed[0:3] = b"\x09\x08\x07"
             term.failures = 1
             with self.assertRaises(BlockingIOError):
                 presenter.present(bytes(changed), width, height, 2, 2)
-            self.assertEqual(presenter.shm.in_flight, 0)
+            self.assertEqual(presenter.shm.in_flight, 1)
             result = presenter.present(bytes(changed), width, height, 2, 2)
             self.assertEqual(result.kind, "full")
         finally:
             presenter.close(discard=True)
+
+    def test_interrupted_inline_chunk_is_cancelled_before_retry(self):
+        for edit in (False, True):
+            for in_tmux in (False, True):
+                with self.subTest(edit=edit, in_tmux=in_tmux):
+                    model = ModelTerm()
+                    writes = []
+
+                    def deliver(value):
+                        writes.append(value)
+                        if in_tmux:
+                            value = re.sub(
+                                r"\x1bPtmux;((?:\x1b\x1b|[^\x1b])*)\x1b\\",
+                                lambda m: m[1].replace("\x1b\x1b", "\x1b"), value,
+                            )
+                        model.write(value)
+
+                    term = mock.Mock()
+                    term.write.side_effect = deliver
+                    presenter = FramePresenter(
+                        term, stream=True, in_tmux=in_tmux, enable_scroll=False,
+                        stream_warmup_seconds=0, stream_keyframe_seconds=0,
+                    )
+                    rgb = random.Random(42).randbytes(96 * 64 * 3)
+                    try:
+                        if edit:
+                            presenter.present(frame(96, 64), 96, 64, 12, 8)
+
+                        def interrupted(value):
+                            # Accept exactly the first complete nonfinal APC.
+                            end = value.index("\x1b\\") + 2
+                            if in_tmux:
+                                end = value.index("\x1b\\", end) + 2
+                            deliver(value[:end])
+                            raise BlockingIOError("injected partial delivery")
+
+                        term.write.side_effect = interrupted
+                        with self.assertRaises(BlockingIOError):
+                            presenter.present(rgb, 96, 64, 12, 8)
+                        self.assertIsNotNone(model._metadata)
+                        self.assertEqual(model._metadata["m"], "1")
+                        self.assertEqual(model._metadata["a"], "f" if edit else "T")
+                        term.write.side_effect = deliver
+                        result = presenter.present(rgb, 96, 64, 12, 8)
+                        self.assertEqual(result.kind, "full")
+                        self.assertEqual(model.frame, rgb)
+                        self.assertEqual(result.wire_bytes, len(writes[-1]))
+                        self.assertEqual(
+                            presenter.present(rgb, 96, 64, 12, 8).kind, "unchanged"
+                        )
+                    finally:
+                        presenter.close()
+
+    def test_delayed_shm_command_keeps_original_payload_across_retry(self):
+        for full in (False, True):
+            with self.subTest(full=full):
+                term = ConsumerTerm()
+                presenter = FramePresenter(term, shm_slots=1, enable_scroll=False)
+                try:
+                    before = frame(8, 4)
+                    presenter.present(before, 8, 4, 4, 2)
+                    changed = b"\x09\x08\x07" + before[3:]
+                    delayed = []
+
+                    def interrupted(value):
+                        delayed.append(value)
+                        raise BlockingIOError("accepted command; deferred consumption")
+
+                    with mock.patch.object(term, "write", side_effect=interrupted):
+                        with self.assertRaises(BlockingIOError):
+                            presenter.present(changed, 8, 4, 4, 2, force_full=full)
+                    self.assertEqual(presenter.shm.in_flight, 1)
+                    model = ModelTerm()
+                    with mock.patch.object(term, "write", side_effect=model.write):
+                        result = presenter.present(changed, 8, 4, 4, 2)
+                    self.assertEqual(result.kind, "full")
+                    self.assertEqual(model.frame, changed)
+                    # A delayed reader still sees the original geometry's data.
+                    term.write(delayed[0])
+                    self.assertEqual(term.payloads[-1], changed if full else changed[:3])
+                    self.assertEqual(presenter.shm.in_flight, 0)
+                finally:
+                    presenter.close(discard=True)
 
     def test_failed_transition_forces_full_before_disjoint_damage(self):
         for force_full in (False, True):
