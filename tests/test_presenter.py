@@ -1110,9 +1110,40 @@ class PresenterTests(unittest.TestCase):
                 presenter.present(bytes(changed), width, height, 2, 2)
             self.assertEqual(presenter.shm.in_flight, 0)
             result = presenter.present(bytes(changed), width, height, 2, 2)
-            self.assertEqual(result.kind, "rect")
+            self.assertEqual(result.kind, "full")
         finally:
             presenter.close(discard=True)
+
+    def test_failed_transition_forces_full_before_disjoint_damage(self):
+        for force_full in (False, True):
+            with self.subTest(force_full=force_full):
+                term = ModelTerm()
+                presenter = FramePresenter(
+                    term, stream=True, enable_scroll=False,
+                    stream_warmup_seconds=0, stream_keyframe_seconds=0,
+                )
+                try:
+                    before = frame(3, 1)
+                    failed = b"\xff\0\0" + before[3:]
+                    after = failed[:6] + b"\0\0\xff"
+                    presenter.present(before, 3, 1, 3, 1)
+                    with mock.patch.object(term, "write", side_effect=BlockingIOError):
+                        with self.assertRaises(BlockingIOError):
+                            presenter.present(
+                                failed, 3, 1, 3, 1, damage=((0, 0, 1, 1),),
+                                force_full=force_full,
+                            )
+                    result = presenter.present(
+                        after, 3, 1, 3, 1, damage=((2, 0, 1, 1),),
+                    )
+                    self.assertEqual(result.kind, "full")
+                    self.assertEqual(term.frame, after)
+                    self.assertEqual(
+                        presenter.present(after, 3, 1, 3, 1, damage=()).kind,
+                        "unchanged",
+                    )
+                finally:
+                    presenter.close()
 
     def test_latency_history_is_bounded_but_aggregates_are_complete(self):
         now = [10.0]

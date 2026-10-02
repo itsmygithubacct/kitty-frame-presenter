@@ -1552,7 +1552,15 @@ class FramePresenter:
 
     def _write(self, sequence: str) -> int:
         if sequence:
-            self.terminal.write(sequence)
+            try:
+                self.terminal.write(sequence)
+            except Exception:
+                # A failed write may have applied only part of a transaction.
+                # Future damage hints describe producer transitions, so the
+                # next successful write must rebuild the complete placement.
+                self._previous = None
+                self._base_signature = None
+                raise
         # Every sequence assembled here is ASCII.  Encoding it solely to count
         # wire bytes doubled peak storage for large inline frames.
         return len(sequence)
