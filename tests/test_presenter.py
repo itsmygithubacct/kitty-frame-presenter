@@ -173,6 +173,38 @@ class DamageTests(unittest.TestCase):
             diff_rects(before, after, width, height), ((0, 0, 1, 1), (19, 19, 1, 1))
         )
 
+    def test_sideways_move_keeps_the_exposed_strips(self):
+        width, height = 40, 16
+        dx, block_w, block_h = 4, 24, 10
+        x, y = 2, 2
+        before = bytearray(frame(width, height, (8, 16, 24)))
+        after = bytearray(before)
+        for row in range(y, y + block_h):
+            at = (row * width + x) * 3
+            before[at:at + block_w * 3] = bytes((20, 90, 160)) * block_w
+            moved = (row * width + x + dx) * 3
+            after[moved:moved + block_w * 3] = bytes((20, 90, 160)) * block_w
+        strips = ((x, y, dx, block_h), (x + block_w, y, dx, block_h))
+        self.assertEqual(diff_rects(before, after, width, height), strips)
+        self.assertEqual(
+            diff_rects(before, after, width, height, max_rects=1),
+            ((x, y, block_w + dx, block_h),),
+        )
+
+    def test_narrow_column_hole_stays_one_rectangle(self):
+        width, height = 12, 4
+        before = bytearray(frame(width, height))
+        after = bytearray(before)
+        for row in range(height):
+            for column in range(width):
+                if column == 6:
+                    continue
+                at = (row * width + column) * 3
+                after[at:at + 3] = b"\x01\x02\x03"
+        self.assertEqual(
+            diff_rects(before, after, width, height), ((0, 0, width, height),)
+        )
+
     def test_damage_hints_scan_and_shrink_disjoint_regions(self):
         width, height = 20, 12
         before = frame(width, height)
@@ -592,7 +624,84 @@ def reference_rects(prev, cur, width, height, max_rects=2):
                    != cur[(y * width + x) * 3:(y * width + x) * 3 + 3]]
         left, right = min(columns), max(columns) + 1
         out.append((left, top, right - left, bottom - top))
-    return tuple(out)
+    return _reference_column_splits(prev, cur, width, out, max_rects)
+
+
+def _reference_widest_gap(prev, cur, width, rect):
+    """Per-pixel twin of the presenter's widest interior column gap."""
+    x, y, rect_w, rect_h = rect
+    if rect_w < 3 or rect_h < 1:
+        return None
+    dirty = []
+    for column in range(rect_w):
+        flag = False
+        for row in range(rect_h):
+            at = ((y + row) * width + x + column) * 3
+            if prev[at:at + 3] != cur[at:at + 3]:
+                flag = True
+                break
+        dirty.append(flag)
+    best_at, best_width, run_at = 0, 0, None
+    for index, flag in enumerate(dirty):
+        if flag:
+            if run_at is not None and run_at > 0 and index - run_at > best_width:
+                best_at, best_width = run_at, index - run_at
+            run_at = None
+        elif run_at is None:
+            run_at = index
+    if best_width < 1:
+        return None
+    return best_at, best_width
+
+
+def _reference_tight(prev, cur, width, rect):
+    x, y, rect_w, rect_h = rect
+    columns, rows = [], []
+    for row in range(rect_h):
+        for column in range(rect_w):
+            at = ((y + row) * width + x + column) * 3
+            if prev[at:at + 3] != cur[at:at + 3]:
+                columns.append(x + column)
+                rows.append(y + row)
+    if not columns:
+        return None
+    left, right = min(columns), max(columns) + 1
+    top, bottom = min(rows), max(rows) + 1
+    return left, top, right - left, bottom - top
+
+
+def _reference_column_splits(prev, cur, width, rects, max_rects):
+    """Spare slots keep a full-height column gap below 85% of its box."""
+    rects = list(rects)
+    while len(rects) < max_rects:
+        chosen = None
+        for index, rect in enumerate(rects):
+            gap = _reference_widest_gap(prev, cur, width, rect)
+            if gap is None:
+                continue
+            gap_at, gap_width = gap
+            if gap_width * 20 < rect[2] * 3:
+                continue
+            x, y, rect_w, rect_h = rect
+            left = _reference_tight(prev, cur, width, (x, y, gap_at, rect_h))
+            right = _reference_tight(
+                prev, cur, width,
+                (x + gap_at + gap_width, y, rect_w - gap_at - gap_width, rect_h))
+            if left is None or right is None:
+                continue
+            before = rect_w * rect_h
+            after = left[2] * left[3] + right[2] * right[3]
+            if after * 20 >= before * 17:
+                continue
+            savings = before - after
+            if chosen is None or savings > chosen[0] or (
+                    savings == chosen[0] and index < chosen[1]):
+                chosen = (savings, index, left, right)
+        if chosen is None:
+            break
+        _savings, index, left, right = chosen
+        rects[index:index + 1] = [left, right]
+    return tuple(rects)
 
 
 def reference_shift(prev, width, height, dx, dy):
@@ -835,6 +944,29 @@ class WireAccountingTests(unittest.TestCase):
 
 
 class PresenterTests(unittest.TestCase):
+    def test_unhinted_sideways_move_uploads_the_strips(self):
+        width, height = 36, 12
+        dx, block_w, block_h = 3, 20, 8
+        x, y = 1, 2
+        before = bytearray(frame(width, height, (4, 5, 6)))
+        after = bytearray(before)
+        color = bytes((9, 8, 7)) * block_w
+        for row in range(y, y + block_h):
+            before[(row * width + x) * 3:(row * width + x + block_w) * 3] = color
+            after[(row * width + x + dx) * 3:(row * width + x + dx + block_w) * 3] = color
+        term = ConsumerTerm()
+        presenter = FramePresenter(term, image_id=4, enable_scroll=True)
+        try:
+            presenter.present(bytes(before), width, height, 9, 3)
+            result = presenter.present(bytes(after), width, height, 9, 3)
+            self.assertEqual(result.kind, "rect")
+            self.assertEqual(
+                result.rects, ((x, y, dx, block_h), (x + block_w, y, dx, block_h))
+            )
+            self.assertEqual(result.pixel_bytes, dx * block_h * 3 * 2)
+        finally:
+            presenter.close(discard=True)
+
     def test_full_then_exact_rect_over_shared_memory(self):
         term = ConsumerTerm()
         presenter = FramePresenter(term, image_id=9)

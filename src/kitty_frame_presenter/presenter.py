@@ -239,6 +239,141 @@ def diff_band(
     return None if rect is None else (rect[1], rect[3])
 
 
+def _widest_column_gap(
+    prev: bytes, cur: bytes, frame_width: int, rect: Rect
+) -> tuple[int, int] | None:
+    """Return the widest clean column run strictly inside ``rect``.
+
+    The run is relative to ``rect`` and is unchanged on every row of it.
+    A sideways move shares its rows, so a row-gap split cannot see the two
+    exposed strips.  Their separating columns can.
+    """
+    x, y, width, height = rect
+    if width < 3 or height < 1:
+        return None
+    stride = frame_width * FRAME_BYTES
+    dirty = bytearray(width)
+    step = _SCAN_PIXELS
+    for row in range(height):
+        base = (y + row) * stride + x * FRAME_BYTES
+        column = 0
+        while column < width:
+            count = min(step, width - column)
+            start = base + column * FRAME_BYTES
+            end = start + count * FRAME_BYTES
+            if prev[start:end] == cur[start:end]:
+                column += count
+                continue
+            for _pixel in range(count):
+                pixel = start + (_pixel * FRAME_BYTES)
+                if prev[pixel : pixel + FRAME_BYTES] != cur[pixel : pixel + FRAME_BYTES]:
+                    dirty[column + _pixel] = 1
+            column += count
+    best_at = 0
+    best_width = 0
+    run_at: int | None = None
+    for index, flag in enumerate(dirty):
+        if flag:
+            if run_at is not None and run_at > 0:
+                gap_width = index - run_at
+                if gap_width > best_width:
+                    best_at = run_at
+                    best_width = gap_width
+            run_at = None
+        elif run_at is None:
+            run_at = index
+    if best_width < 1:
+        return None
+    return best_at, best_width
+
+
+def _tight_rect(
+    prev: bytes, cur: bytes, frame_width: int, rect: Rect
+) -> Rect | None:
+    """Bounding rectangle of the pixels that differ inside ``rect``."""
+    x, y, width, height = rect
+    if width < 1 or height < 1:
+        return None
+    stride = frame_width * FRAME_BYTES
+    top: int | None = None
+    bottom = y
+    left, right = x + width, x
+    row_bytes = width * FRAME_BYTES
+    for row in range(y, y + height):
+        offset = row * stride + x * FRAME_BYTES
+        if prev[offset : offset + row_bytes] == cur[offset : offset + row_bytes]:
+            continue
+        bounds = _row_bounds(prev, cur, offset, width)
+        if not bounds:
+            continue
+        if top is None:
+            top = row
+        bottom = row + 1
+        left = min(left, x + bounds[0])
+        right = max(right, x + bounds[1])
+    if top is None or right <= left:
+        return None
+    return left, top, right - left, bottom - top
+
+
+def _column_gap_split(
+    prev: bytes, cur: bytes, frame_width: int, rect: Rect
+) -> tuple[Rect, Rect] | None:
+    """Split ``rect`` around its widest full-height clean column gap.
+
+    The split is kept only when the two pieces cover less than 85% of the
+    bounding rectangle.  A one-column hole in a line of text stays one
+    rectangle; the empty interior of a moved window does not.
+    """
+    gap = _widest_column_gap(prev, cur, frame_width, rect)
+    if gap is None:
+        return None
+    x, y, width, height = rect
+    gap_at, gap_width = gap
+    # The untouched columns already decide the ratio when both pieces keep
+    # this height.  Tightening can only make them smaller.
+    if gap_width * 20 < width * 3:
+        return None
+    left = _tight_rect(prev, cur, frame_width, (x, y, gap_at, height))
+    right = _tight_rect(
+        prev, cur, frame_width, (x + gap_at + gap_width, y, width - gap_at - gap_width, height)
+    )
+    if left is None or right is None:
+        return None
+    before = width * height
+    after = left[2] * left[3] + right[2] * right[3]
+    if after * 20 >= before * 17:
+        return None
+    return left, right
+
+
+def _split_column_gaps(
+    prev: bytes,
+    cur: bytes,
+    frame_width: int,
+    rects: list[Rect],
+    max_rects: int,
+) -> tuple[Rect, ...]:
+    """Use spare rectangle slots to keep clean column gaps."""
+    while len(rects) < max_rects:
+        chosen: tuple[int, int, Rect, Rect] | None = None
+        for index, rect in enumerate(rects):
+            split = _column_gap_split(prev, cur, frame_width, rect)
+            if split is None:
+                continue
+            left, right = split
+            savings = rect[2] * rect[3] - left[2] * left[3] - right[2] * right[3]
+            if chosen is None or savings > chosen[0] or (
+                savings == chosen[0] and index < chosen[1]
+            ):
+                chosen = (savings, index, left, right)
+        if chosen is None:
+            break
+        _savings, index, left, right = chosen
+        rects[index : index + 1] = [left, right]
+    return tuple(rects)
+
+
 def diff_rects(
     prev: object,
     cur: object,
@@ -246,11 +381,12 @@ def diff_rects(
     height: int,
     max_rects: int = 2,
 ) -> tuple[Rect, ...]:
-    """Return up to ``max_rects`` exact rectangles split at clean row gaps.
+    """Return up to ``max_rects`` exact rectangles split at clean gaps.
 
     Scroll composition commonly leaves two disjoint regions: fixed chrome at
-    one edge and a newly exposed strip at the other.  Keeping those separate
-    avoids turning their bounding box back into an almost-full frame.
+    one edge and a newly exposed strip at the other.  A window that slides
+    sideways leaves two strips on the same rows.  Keeping either pair
+    separate avoids uploading the unchanged pixels between them.
     """
     max_rects = _integer(max_rects, "max_rects", minimum=1)
     p, c = _valid_frames(prev, cur, width, height)
@@ -313,7 +449,7 @@ def diff_rects(
                 if left == 0 and right == width:
                     break
         out.append((left, top, right - left, bottom - top))
-    return tuple(out)
+    return _split_column_gaps(p, c, width, out, max_rects)
 
 
 def _damage_hint(value: object, width: int, height: int) -> tuple[Rect, ...] | None:
@@ -1765,10 +1901,13 @@ class FramePresenter:
             max_rects = self.shm.capacity
         rects: tuple[Rect, ...]
         if request.damage is None:
-            normal = diff_rect(
-                self._previous, request.rgb, request.width, request.height
+            rects = diff_rects(
+                self._previous,
+                request.rgb,
+                request.width,
+                request.height,
+                max_rects=max_rects,
             )
-            rects = () if normal is None else (normal,)
         else:
             rects = diff_damage_rects(
                 self._previous,
