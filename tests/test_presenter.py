@@ -628,19 +628,14 @@ def reference_rects(prev, cur, width, height, max_rects=2):
 
 
 def _reference_widest_gap(prev, cur, width, rect):
-    """Per-pixel twin of the presenter's widest interior column gap."""
+    """Per-pixel twin of the top-row column gap confirmed down the rectangle."""
     x, y, rect_w, rect_h = rect
     if rect_w < 3 or rect_h < 1:
         return None
     dirty = []
     for column in range(rect_w):
-        flag = False
-        for row in range(rect_h):
-            at = ((y + row) * width + x + column) * 3
-            if prev[at:at + 3] != cur[at:at + 3]:
-                flag = True
-                break
-        dirty.append(flag)
+        at = (y * width + x + column) * 3
+        dirty.append(prev[at:at + 3] != cur[at:at + 3])
     best_at, best_width, run_at = 0, 0, None
     for index, flag in enumerate(dirty):
         if flag:
@@ -651,6 +646,11 @@ def _reference_widest_gap(prev, cur, width, rect):
             run_at = index
     if best_width < 1:
         return None
+    for row in range(1, rect_h):
+        for column in range(best_at, best_at + best_width):
+            at = ((y + row) * width + x + column) * 3
+            if prev[at:at + 3] != cur[at:at + 3]:
+                return None
     return best_at, best_width
 
 

@@ -239,39 +239,30 @@ def diff_band(
     return None if rect is None else (rect[1], rect[3])
 
 
-def _widest_column_gap(
-    prev: bytes, cur: bytes, frame_width: int, rect: Rect
-) -> tuple[int, int] | None:
-    """Return the widest clean column run strictly inside ``rect``.
-
-    The run is relative to ``rect`` and is unchanged on every row of it.
-    A sideways move shares its rows, so a row-gap split cannot see the two
-    exposed strips.  Their separating columns can.
-    """
-    x, y, width, height = rect
-    if width < 3 or height < 1:
-        return None
-    stride = frame_width * FRAME_BYTES
+def _row_dirty(prev: bytes, cur: bytes, offset: int, width: int) -> bytearray:
+    """Dirty flags for one row, using chunk compares before pixel compares."""
     dirty = bytearray(width)
     step = _SCAN_PIXELS
-    for row in range(height):
-        base = (y + row) * stride + x * FRAME_BYTES
-        column = 0
-        while column < width:
-            count = min(step, width - column)
-            start = base + column * FRAME_BYTES
-            end = start + count * FRAME_BYTES
-            if prev[start:end] == cur[start:end]:
-                column += count
-                continue
-            for _pixel in range(count):
-                pixel = start + (_pixel * FRAME_BYTES)
-                if prev[pixel : pixel + FRAME_BYTES] != cur[pixel : pixel + FRAME_BYTES]:
-                    dirty[column + _pixel] = 1
-            column += count
+    column = 0
+    while column < width:
+        count = min(step, width - column)
+        start = offset + column * FRAME_BYTES
+        end = start + count * FRAME_BYTES
+        if prev[start:end] != cur[start:end]:
+            for pixel in range(count):
+                at = start + pixel * FRAME_BYTES
+                if prev[at : at + FRAME_BYTES] != cur[at : at + FRAME_BYTES]:
+                    dirty[column + pixel] = 1
+        column += count
+    return dirty
+
+
+def _widest_interior_run(dirty: bytearray) -> tuple[int, int] | None:
+    """Widest clean run that does not touch either end of ``dirty``."""
     best_at = 0
     best_width = 0
     run_at: int | None = None
+    width = len(dirty)
     for index, flag in enumerate(dirty):
         if flag:
             if run_at is not None and run_at > 0:
@@ -285,6 +276,34 @@ def _widest_column_gap(
     if best_width < 1:
         return None
     return best_at, best_width
+
+
+def _widest_column_gap(
+    prev: bytes, cur: bytes, frame_width: int, rect: Rect
+) -> tuple[int, int] | None:
+    """Return the widest clean column run strictly inside ``rect``.
+
+    The run is relative to ``rect``.  A full-height gap is clean on the top
+    row, so that row proposes the gap and each row below confirms it with one
+    compare.  A sideways move shares its rows; this is the gap between the
+    two strips a row-gap split cannot see.
+    """
+    x, y, width, height = rect
+    if width < 3 or height < 1:
+        return None
+    stride = frame_width * FRAME_BYTES
+    gap = _widest_interior_run(
+        _row_dirty(prev, cur, y * stride + x * FRAME_BYTES, width)
+    )
+    if gap is None:
+        return None
+    gap_at, gap_width = gap
+    span = gap_width * FRAME_BYTES
+    for row in range(1, height):
+        at = (y + row) * stride + (x + gap_at) * FRAME_BYTES
+        if prev[at : at + span] != cur[at : at + span]:
+            return None
+    return gap_at, gap_width
 
 
 def _tight_rect(
@@ -1901,13 +1920,23 @@ class FramePresenter:
             max_rects = self.shm.capacity
         rects: tuple[Rect, ...]
         if request.damage is None:
-            rects = diff_rects(
-                self._previous,
-                request.rgb,
-                request.width,
-                request.height,
-                max_rects=max_rects,
+            # diff_rect stops once the box is known. A column gap is checked
+            # on that box, so a sideways move uploads its strips without a
+            # second full-height scan of an unrelated scroll.
+            normal = diff_rect(
+                self._previous, request.rgb, request.width, request.height
             )
+            split = None
+            if normal is not None and max_rects > 1:
+                split = _column_gap_split(
+                    self._previous, request.rgb, request.width, normal
+                )
+            if normal is None:
+                rects = ()
+            elif split is None:
+                rects = (normal,)
+            else:
+                rects = split
         else:
             rects = diff_damage_rects(
                 self._previous,
