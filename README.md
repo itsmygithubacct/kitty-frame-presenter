@@ -141,9 +141,10 @@ kitty-frame-presenter is one of the repositories behind
 install whose desktop is [Kilix](https://github.com/itsmygithubacct/kilix#readme)
 running the [Kilix 95](https://github.com/itsmygithubacct/kilix-95#readme)
 desktop through [Pleb](https://github.com/itsmygithubacct/pleb#readme).
-It ships inside Kilix as the `third_party/kitty-frame-presenter` submodule and
-draws every pixel pane Kilix shows. The map of every repository and how it
-ships is on the
+It ships inside Kilix as the `third_party/kitty-frame-presenter` submodule,
+through which Kilix's in-pane browser, application panes and the Kilix 95
+desktop present their frames. The map of every repository and how it ships is
+on the
 [components page](https://github.com/itsmygithubacct/plebian-os/blob/main/docs/components.md).
 
 ## License
