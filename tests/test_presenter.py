@@ -1,4 +1,6 @@
 import base64
+import ctypes
+import ctypes.util
 import errno
 import os
 import random
@@ -44,6 +46,50 @@ from kitty_frame_presenter.presenter import (  # noqa: E402
 )
 
 
+# POSIX shared-memory objects are files under /dev/shm only on Linux; FreeBSD
+# keeps them in the kernel. The tests reach them through shm_open(3), as Kitty
+# does, so they run on either.
+_LIBC = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+_LIBC.shm_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_uint]
+_LIBC.shm_unlink.argtypes = [ctypes.c_char_p]
+
+
+def _shm_name(name):
+    return ("/" + name.lstrip("/")).encode("ascii")
+
+
+def _shm_exists(name):
+    fd = _LIBC.shm_open(_shm_name(name), os.O_RDONLY, 0)
+    if fd < 0:
+        return False
+    os.close(fd)
+    return True
+
+
+def _shm_read(name):
+    fd = _LIBC.shm_open(_shm_name(name), os.O_RDONLY, 0)
+    if fd < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), name)
+    try:
+        size = os.fstat(fd).st_size
+        data = b""
+        while len(data) < size:
+            chunk = os.pread(fd, size - len(data), len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data
+    finally:
+        os.close(fd)
+
+
+def _shm_unlink(name):
+    if _LIBC.shm_unlink(_shm_name(name)) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), name)
+
+
 class ConsumerTerm:
     """Fake Kitty that reads and unlinks every t=s object synchronously."""
 
@@ -60,10 +106,8 @@ class ConsumerTerm:
             return
         for match in self.SHM.finditer(value):
             name = base64.b64decode(match.group(2)).decode("ascii")
-            path = "/dev/shm/" + name.lstrip("/")
-            with open(path, "rb") as stream:
-                self.payloads.append(stream.read())
-            os.unlink(path)
+            self.payloads.append(_shm_read(name))
+            _shm_unlink(name)
 
     def output(self):
         return "".join(self.writes)
@@ -312,11 +356,10 @@ class SharedMemoryTests(unittest.TestCase):
             self.assertEqual(ring.in_flight, 2)
             with self.assertRaises(ShmBusy):
                 ring.put_many((b"third",))
-            os.unlink("/dev/shm/" + names[0].lstrip("/"))
+            _shm_unlink(names[0])
             replacement = ring.put_many((b"third",))[0]
             self.assertEqual(replacement, names[0])
-            with open("/dev/shm/" + replacement.lstrip("/"), "rb") as stream:
-                self.assertEqual(stream.read(), b"third")
+            self.assertEqual(_shm_read(replacement), b"third")
         finally:
             ring.close(discard=True)
 
@@ -330,30 +373,25 @@ class SharedMemoryTests(unittest.TestCase):
             ):
                 ring.put_many((b"payload",))
             self.assertEqual(ring.in_flight, 0)
-            self.assertFalse(os.path.exists("/dev/shm/" + name.lstrip("/")))
+            self.assertFalse(_shm_exists(name))
         finally:
             ring.close()
 
     def test_close_keeps_unconsumed_payload_available(self):
         ring = PosixShmRing(1, prefix="kitty-frame-presenter-close-test")
         name = ring.put_many((b"deferred",))[0]
-        path = "/dev/shm/" + name.lstrip("/")
-
         ring.close()
 
-        self.assertTrue(os.path.exists(path))
-        with open(path, "rb") as stream:
-            self.assertEqual(stream.read(), b"deferred")
-        os.unlink(path)
+        self.assertTrue(_shm_exists(name))
+        self.assertEqual(_shm_read(name), b"deferred")
+        _shm_unlink(name)
 
     def test_discard_explicitly_unlinks_unconsumed_payload(self):
         ring = PosixShmRing(1, prefix="kitty-frame-presenter-discard-test")
         name = ring.put_many((b"abandoned",))[0]
-        path = "/dev/shm/" + name.lstrip("/")
-
         ring.close(discard=True)
 
-        self.assertFalse(os.path.exists(path))
+        self.assertFalse(_shm_exists(name))
 
     def test_name_collision_never_unlinks_an_object_the_ring_did_not_create(self):
         ring = PosixShmRing(1, prefix="kitty-frame-presenter-collision-test")
@@ -363,7 +401,7 @@ class SharedMemoryTests(unittest.TestCase):
         try:
             with self.assertRaises(OSError):
                 ring.put_many((b"ours",))
-            self.assertTrue(os.path.exists("/dev/shm/" + name.lstrip("/")))
+            self.assertTrue(_shm_exists(name))
             self.assertEqual(ring.in_flight, 0)
         finally:
             ring._unlink(name)
@@ -408,7 +446,7 @@ class SharedMemoryTests(unittest.TestCase):
         with PosixShmRing(1, prefix="kitty-frame-presenter-context-test") as ring:
             self.assertEqual(ring.put_many(()), ())
             name = ring.put_many((b"consumed",))[0]
-            os.unlink("/dev/shm/" + name.lstrip("/"))
+            _shm_unlink(name)
             self.assertEqual(ring.reap(), 1)
             self.assertEqual(ring.in_flight, 0)
         self.assertEqual(ring.reap(), 0)
@@ -418,12 +456,12 @@ class SharedMemoryTests(unittest.TestCase):
 
     def test_multi_payload_validation_failure_rolls_back_prior_objects(self):
         ring = PosixShmRing(2, prefix="kitty-frame-presenter-rollback-test")
-        paths = ["/dev/shm/" + slot.name.lstrip("/") for slot in ring._slots]
+        names = [slot.name for slot in ring._slots]
         try:
             with self.assertRaises(ValueError):
                 ring.put_many((b"made", b""))
             self.assertEqual(ring.in_flight, 0)
-            self.assertFalse(any(os.path.exists(path) for path in paths))
+            self.assertFalse(any(_shm_exists(name) for name in names))
         finally:
             ring.close(discard=True)
 
@@ -1098,7 +1136,7 @@ class PresenterTests(unittest.TestCase):
                 self.assertEqual(presenter.shm.in_flight, 0)
             for slot in presenter.shm._slots:
                 self.assertFalse(
-                    os.path.exists("/dev/shm/" + slot.name.lstrip("/")))
+                    _shm_exists(slot.name))
             result = presenter.present(rgb, width, height, 2, 2)
             self.assertEqual(result.kind, "full")
             self.assertTrue(result.emitted)
@@ -1168,7 +1206,7 @@ class PresenterTests(unittest.TestCase):
             ):
                 self.assertEqual(presenter.flush(now=11.001).kind, "queued")
             name = presenter.shm._slots[0].name
-            os.unlink("/dev/shm/" + name.lstrip("/"))
+            _shm_unlink(name)
             self.assertTrue(presenter.flush(now=11.01).emitted)
         finally:
             presenter.close(discard=True)

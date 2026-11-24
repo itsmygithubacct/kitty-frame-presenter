@@ -46,6 +46,21 @@ _SESSION_CHARACTERS = frozenset(
 Rect = tuple[int, int, int, int]
 
 
+
+def _getpeereid_uid(sock: socket.socket) -> int | None:
+    """The effective uid of a connected Unix-socket peer, or None."""
+    libc_name = ctypes.util.find_library("c")
+    if not libc_name:
+        return None
+    try:
+        getpeereid = ctypes.CDLL(libc_name, use_errno=True).getpeereid
+    except (AttributeError, OSError):
+        return None
+    uid, gid = ctypes.c_uint32(), ctypes.c_uint32()
+    if getpeereid(sock.fileno(), ctypes.byref(uid), ctypes.byref(gid)) != 0:
+        return None
+    return uid.value
+
 class TerminalWriter(Protocol):
     def write(self, value: str) -> object: ...
 
@@ -1200,7 +1215,9 @@ class FrameSocketTap:
     @staticmethod
     def _peer_is_owner(sock: socket.socket) -> bool:
         if not hasattr(socket, "SO_PEERCRED"):
-            return True
+            # FreeBSD, macOS and the other BSDs: getpeereid(3) answers the
+            # same question. Credentials that cannot be read refuse the peer.
+            return _getpeereid_uid(sock) == os.geteuid()
         size = struct.calcsize("3i")
         credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, size)
         _pid, uid, _gid = struct.unpack("3i", credentials)
